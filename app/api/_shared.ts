@@ -22,10 +22,9 @@ export function errJson(message: string, code: ErrorCode, status = 400) {
 /** ---------- Rate limiting (per-IP, in-memory) ---------- */
 export type RLState = { count: number; resetAt: number };
 
+// Global maps for simple in-memory rate limiting per bucket.
 declare global {
-  // eslint-disable-next-line no-var
   var __DETECT_RL__: Map<string, RLState> | undefined;
-  // eslint-disable-next-line no-var
   var __ANALYZE_RL__: Map<string, RLState> | undefined;
 }
 
@@ -80,18 +79,21 @@ export async function withRetry<T>(
   const withTimeout = <U>(p: Promise<U>, ms: number) =>
     new Promise<U>((resolve, reject) => {
       const to = setTimeout(() => reject(new Error("timeout")), ms);
-      p.then((v) => { clearTimeout(to); resolve(v); })
-       .catch((e) => { clearTimeout(to); reject(e); });
+      p.then((v) => {
+        clearTimeout(to);
+        resolve(v);
+      }).catch((e) => {
+        clearTimeout(to);
+        reject(e);
+      });
     });
 
   for (let i = 0; i < tries; i++) {
     try {
-      // eslint-disable-next-line no-await-in-loop
       return await withTimeout(fn(), timeoutMs);
     } catch (e) {
       lastErr = e;
       // jittered backoff
-      // eslint-disable-next-line no-await-in-loop
       await new Promise((r) => setTimeout(r, base * Math.pow(2, i) + Math.random() * 150));
     }
   }

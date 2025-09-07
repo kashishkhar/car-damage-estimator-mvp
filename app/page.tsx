@@ -11,6 +11,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AnalyzePayload, DamageItem } from "./types";
+import type { YoloBoxRel } from "./types";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Public thresholds (mirror server; safe to expose)
@@ -50,6 +51,19 @@ function aggDecisionConf(items: DamageItem[]): number {
     num += conf * w; den += w;
   }
   return den ? num / den : 0.5;
+}
+
+function isYoloBoxRel(v: unknown): v is YoloBoxRel {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  const bbox = o["bbox_rel"];
+  const conf = o["confidence"];
+  return (
+    Array.isArray(bbox) &&
+    bbox.length === 4 &&
+    bbox.every((n) => typeof n === "number") &&
+    typeof conf === "number"
+  );
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -439,22 +453,28 @@ export default function Home() {
         return;
       }
 
-      // 2) ANALYZE (pass YOLO seeds)
-      const seeds = Array.isArray(detectJson?.yolo_boxes)
-        ? detectJson.yolo_boxes
-            .filter((b: any) => Array.isArray(b.bbox_rel) && b.bbox_rel.length === 4)
-            .map((b: any) => ({ bbox_rel: b.bbox_rel, confidence: b.confidence ?? 0.5 }))
-        : [];
+      // 2) ANALYZE – pass YOLO boxes as seeds if present (typed, guarded)
+      const seeds: { bbox_rel: [number, number, number, number]; confidence: number }[] =
+        Array.isArray(detectJson?.yolo_boxes)
+          ? (detectJson.yolo_boxes as unknown[])
+              .filter(isYoloBoxRel)
+              .map((b) => ({
+                bbox_rel: b.bbox_rel,
+                confidence: typeof b.confidence === "number" ? b.confidence : 0.5,
+              }))
+          : [];
+
       analyzeForm.append("yolo", JSON.stringify(seeds));
 
+      // 2) ANALYZE
       const ar = await fetch("/api/analyze", { method: "POST", body: analyzeForm });
       if (!ar.ok) { setError(friendlyApiError(await ar.text(), ar.status)); return; }
-      const j: AnalyzePayload = await ar.json();
+      const j = await ar.json();
 
       // A couple of guardrails to avoid false positives on non-vehicle photos:
       const noItems = !Array.isArray(j?.damage_items) || j.damage_items.length === 0;
       if (noItems && Number(j?.vehicle?.confidence ?? 0) < 0.15) {
-        setError("We couldn’t detect a vehicle in that image. Please upload a photo that clearly shows a vehicle.");
+        setError("We couldn't detect a vehicle in that image. Please upload a photo that clearly shows a vehicle.");
         return;
       }
 
@@ -533,13 +553,6 @@ export default function Home() {
   const selectSample = useCallback((url: string) => {
     setMode("url"); setImageUrl(url); setPreview(url); setResult(null); setError(""); setValidationIssues(null);
   }, []);
-
-  const metrics = useMemo(() => {
-    const maxSev = Math.max(0, ...((result?.damage_items ?? []).map((d) => Number(d.severity ?? 0)) as number[]));
-    const costHigh = result?.estimate?.cost_high;
-    const aggConf = decisionConf;
-    return { maxSev, costHigh, aggConf };
-  }, [result, decisionConf]);
 
   return (
     <main className="relative min-h-screen text-slate-900">
@@ -622,7 +635,7 @@ export default function Home() {
 
               <div aria-live="polite">
                 {error && (<div className="rounded-lg border border-rose-200/70 bg-rose-50/80 p-3 text-sm text-rose-700">{String(error)}</div>)}
-              </div>
+                </div>
 
               <div className="pt-1 flex flex-col gap-2">
                 <Checkbox id="overlay" checked={showOverlay} onChange={setShowOverlay} label="Show damage overlay" />
@@ -692,11 +705,11 @@ export default function Home() {
               <div className="mb-1 text-sm font-medium">Routing Decision</div>
               <div className="flex flex-wrap items-center gap-2">
                 <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs ${
-                  result.decision.label === "AUTO-APPROVE"
-                    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                    : result.decision.label === "SPECIALIST"
-                    ? "border-rose-200 bg-rose-50 text-rose-700"
-                    : "border-amber-200 bg-amber-50 text-amber-700"
+                    result.decision.label === "AUTO-APPROVE"
+                      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                      : result.decision.label === "SPECIALIST"
+                      ? "border-rose-200 bg-rose-50 text-rose-700"
+                      : "border-amber-200 bg-amber-50 text-amber-700"
                 }`}>{result.decision.label}</span>
               </div>
               <div className="mt-2 text-xs text-slate-600">Confidence: {pct(decisionConf)} ({band(decisionConf)})</div>
@@ -857,7 +870,7 @@ export default function Home() {
                           <div className="text-sm font-medium text-slate-900">Labor</div>
                           <div className="mt-1 text-[13px] text-slate-700">
                             {hoursStr} = <span className="font-medium">${bd.labor.toLocaleString()}</span>
-                          </div>
+            </div>
                         </div>
 
                         {/* Row 2: Paint & Materials */}
@@ -865,13 +878,13 @@ export default function Home() {
                           <div className="text-sm font-medium text-slate-900">Paint &amp; Materials</div>
                           <div className="mt-1 text-[13px] text-slate-700">
                             {zonesStr} = <span className="font-medium">${bd.paint.toLocaleString()}</span>
-                          </div>
+              </div>
                           {paintedZoneCount > 0 && (
                             <div className="mt-1 text-[12px] text-slate-500">
                               Paint is applied once per affected zone to avoid double-charging overlapping work.
-                            </div>
-                          )}
-                        </div>
+            </div>
+          )}
+      </div>
 
                         {/* Row 3: Parts */}
                         <div className="rounded-xl border border-slate-200 bg-white/70 p-3">
@@ -883,7 +896,7 @@ export default function Home() {
                                 {bd.parts_detail.length} part{bd.parts_detail.length === 1 ? "" : "s"} ={" "}
                                 <span className="font-medium">${bd.parts.toLocaleString()}</span>
                                 <span className="ml-2 text-[11px] text-slate-500">(dynamic)</span>
-                              </div>
+        </div>
                               <ul className="mt-1 text-[12px] text-slate-600 space-y-0.5">
                                 {bd.parts_detail.slice(0, 10).map((p, i) => (
                                   <li key={i} className="flex items-center justify-between gap-3">
@@ -904,7 +917,7 @@ export default function Home() {
                               <span className="ml-2 text-[11px] text-slate-500">
                                 {bd.dynamic_parts_used ? "(dynamic)" : "(baseline)"}
                               </span>
-                            </div>
+      </div>
                           )}
                         </div>
 
@@ -912,11 +925,11 @@ export default function Home() {
                         <div className="flex items-center justify-between mt-2">
                           <div className="text-sm text-slate-600">
                             Range: <span className="font-medium">${lo.toLocaleString()} – ${hi.toLocaleString()}</span>
-                          </div>
+        </div>
                           <div className={`text-lg font-semibold tracking-tight ${inBand ? "text-slate-900" : "text-amber-700"}`}>
                             Subtotal: ${subtotal.toLocaleString()}
-                          </div>
-                        </div>
+        </div>
+      </div>
                         {!inBand && (
                           <div className="text-[12px] text-amber-700">
                             Note: subtotal is outside the displayed band; variance or inputs may need adjustment.
@@ -939,7 +952,7 @@ export default function Home() {
                 <div><span className="text-slate-500">Model:</span> {result.model ?? "—"}</div>
                 <div><span className="text-slate-500">runId:</span> {result.runId ?? "—"}</div>
                 <div className="truncate"><span className="text-slate-500">image_sha256:</span> {result.image_sha256 ?? "—"}</div>
-              </div>
+      </div>
             </div>
           )}
 
@@ -951,9 +964,9 @@ export default function Home() {
             {(snapshotUrl || preview) && (
               <img src={snapshotUrl || preview} alt="Vehicle image" className="w-full h-auto border rounded mb-4" style={{ maxHeight: "9in", objectFit: "contain" }} />
             )}
-          </div>
-        </section>
       </div>
+        </section>
+    </div>
     </main>
   );
 }
