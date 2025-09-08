@@ -350,7 +350,7 @@ export async function POST(req: NextRequest) {
 
     // Merge quick gate issues with detect status
     const issues = q.issues.slice();
-    if ((rf.debug?.parsed_count ?? 0) === 0) {
+    if (yolo_boxes.length === 0) {
       issues.push("no_yolo_detections");
     }
 

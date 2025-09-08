@@ -657,12 +657,14 @@ export default function Home() {
     window.print();
   }, [preview, result, yoloBoxes]);  
 
-  const samples = [
-    { url: "https://images.pexels.com/photos/11985216/pexels-photo-11985216.jpeg" },
-    { url: "https://images.pexels.com/photos/6442699/pexels-photo-6442699.jpeg" },
-    { url: "https://i.redd.it/902pxt9a8r4c1.jpg" },
-    { url: "https://preview.redd.it/bfcq81ek7pbf1.jpeg?auto=webp&s=4548c35ddfe6f371a1639df78528b5ea573ae64b" },
+  const rawSamples = [
+    "https://preview.redd.it/could-this-side-impact-damage-possibly-be-a-structural-v0-48xk2ye4dad81.jpg?width=640&crop=smart&auto=webp&s=2e8661fe071e2aacbd413ca4821aab837859176c",
+    "https://diminishedvalueofgeorgia.com/wp-content/uploads/Evidence-of-Severe-Front-End-Damage-on-a-Vehicle-After-an-Accident-scaled.jpg",
+    "https://i.redd.it/902pxt9a8r4c1.jpg",
+    "https://brightonpanelworks.com.au/wp-content/uploads/2019/10/auto-3734396_1280.jpg",
   ];
+  
+  const samples = rawSamples.map((url) => ({ url: `/api/cache-image?url=${encodeURIComponent(url)}` }));  
 
   const selectSample = useCallback((url: string) => {
     setMode("url"); setImageUrl(url); setPreview(url); setResult(null); setError(""); setValidationIssues(null);
