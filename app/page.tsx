@@ -10,7 +10,8 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { AnalyzePayload, DamageItem, YoloBoxRel, RoboflowDebug } from "./types";
+import type { AnalyzePayload, DamageItem } from "./types";
+import type { YoloBoxRel } from "./types";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Public thresholds (mirror server; safe to expose)
@@ -115,7 +116,55 @@ function label(ctx: CanvasRenderingContext2D, text: string, x: number, y: number
   ctx.restore();
 }
 
-/** YOLO overlay that matches <img> with object-contain + letterboxing */
+function CanvasOverlay({ imgRef, items, show }: { imgRef: React.RefObject<HTMLImageElement>; items: DamageItem[]; show: boolean; }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const img = imgRef.current, canvas = canvasRef.current;
+    if (!img || !canvas) return;
+
+    const rect = img.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    canvas.style.width = `${rect.width}px`;
+    canvas.style.height = `${rect.height}px`;
+    canvas.width = Math.round(rect.width * dpr);
+    canvas.height = Math.round(rect.height * dpr);
+
+    const ctx = canvas.getContext("2d"); if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!show) return;
+
+    ctx.scale(dpr, dpr); ctx.lineWidth = 2;
+
+    items.forEach((d) => {
+      const color = sevColor(Number(d.severity ?? 1));
+      ctx.strokeStyle = color; ctx.fillStyle = color + "33";
+
+      if (Array.isArray(d.polygon_rel) && d.polygon_rel.length >= 3) {
+        const pts = d.polygon_rel as [number, number][];
+        ctx.beginPath();
+        pts.forEach(([nx, ny], i) => {
+          const x = nx * rect.width, y = ny * rect.height;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        });
+        ctx.closePath(); ctx.fill(); ctx.stroke();
+        const cx = (pts.reduce((s, p) => s + p[0], 0) / pts.length) * rect.width;
+        const cy = (pts.reduce((s, p) => s + p[1], 0) / pts.length) * rect.height;
+        label(ctx, String(d.part ?? ""), cx, cy, color);
+      } else if (Array.isArray(d.bbox_rel) && d.bbox_rel.length === 4) {
+        const [nx, ny, nw, nh] = d.bbox_rel as [number, number, number, number];
+        const x = nx * rect.width, y = ny * rect.height, w = nw * rect.width, h = nh * rect.height;
+        ctx.beginPath(); ctx.rect(x, y, w, h); ctx.fill(); ctx.stroke();
+        label(ctx, String(d.part ?? ""), x + w / 2, y + 14, color);
+      }
+    });
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+  }, [imgRef, items, show]);
+
+  return <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none" aria-hidden="true" />;
+}
+
 function YoloCanvasOverlay({
   imgRef,
   boxes,
@@ -205,9 +254,10 @@ function YoloCanvasOverlay({
       ctx.fillStyle = "rgba(16,185,129,0.2)";
     });
 
+    // Re-render when the image resizes (e.g., responsive layout)
     const ro = new ResizeObserver(() => {
       canvas.style.width = `${img.getBoundingClientRect().width}px`;
-      requestAnimationFrame(() => {});
+      requestAnimationFrame(() => { /* noop to trigger paint */ });
     });
     ro.observe(img);
 
@@ -482,10 +532,9 @@ export default function Home() {
   const [error, setError] = useState("");
   const [validationIssues, setValidationIssues] = useState<string[] | null>(null);
 
-  // YOLO overlay + detect debug
+  // YOLO overlay + detect issues
   const [yoloBoxes, setYoloBoxes] = useState<YoloBoxRel[]>([]);
   const [detectIssues, setDetectIssues] = useState<string[] | null>(null);
-  const [yoloDebug, setYoloDebug] = useState<RoboflowDebug | null>(null);
 
   // Toggles
   const [showOverlay, setShowOverlay] = useState(true);
@@ -519,7 +568,7 @@ export default function Home() {
 
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
-    setLoading(true); setError(""); setValidationIssues(null); setResult(null); setYoloBoxes([]); setDetectIssues(null); setYoloDebug(null);    
+    setLoading(true); setError(""); setValidationIssues(null); setResult(null); setYoloBoxes([]); setDetectIssues(null);
 
     try {
       const analyzeForm = new FormData(), detectForm = new FormData();
@@ -542,9 +591,6 @@ export default function Home() {
       const dr = await fetch("/api/detect", { method: "POST", body: detectForm });
       if (!dr.ok) { setError(friendlyApiError(await dr.text(), dr.status)); return; }
       const detectJson = await dr.json();
-
-      // Capture debug
-      if (detectJson?.yolo_debug) setYoloDebug(detectJson.yolo_debug as RoboflowDebug);
 
       if (detectJson && detectJson.is_vehicle === false) {
         setError("We couldn’t detect a vehicle in that image. Please upload a photo that clearly shows a vehicle.");
@@ -751,7 +797,7 @@ export default function Home() {
 
               <div aria-live="polite">
                 {error && (<div className="rounded-lg border border-rose-200/70 bg-rose-50/80 p-3 text-sm text-rose-700">{String(error)}</div>)}
-                </div>
+              </div>
 
               <div className="pt-1 flex flex-col gap-2">
                 <Checkbox id="overlay" checked={showOverlay} onChange={setShowOverlay} label="Show damage overlay" />
@@ -781,73 +827,22 @@ export default function Home() {
                 )}
               </div>
 
-              {/* Overlay source + YOLO debug */}
-              <div className="mt-2 flex items-center justify-between">
-                <span className="text-[11px] rounded border border-emerald-300 bg-emerald-50 px-2 py-0.5 text-emerald-700">
-                  overlay: YOLO ({yoloBoxes.length})
-                </span>
+              {/* Overlay source + (optional) detect issues */}
+              <div className="mt-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] rounded border border-emerald-300 bg-emerald-50 px-2 py-0.5 text-emerald-700">
+                    overlay: YOLO ({yoloBoxes.length})
+                  </span>
+                </div>
 
-                <details className="text-[12px]">
-                  <summary className="cursor-pointer text-indigo-700 hover:text-indigo-900">YOLO debug</summary>
-                  <div className="mt-2 space-y-2">
-                    {/* Server-side env and HTTP hints */}
-                    {yoloDebug ? (
-                      <div className="space-y-1">
-                        {Array.isArray(yoloDebug.missing_env) && yoloDebug.missing_env.length > 0 ? (
-                          <div className="text-rose-700">
-                            <div className="font-medium">Missing env vars:</div>
-                            <ul className="ml-5 list-disc">
-                              {yoloDebug.missing_env.map((k: string) => <li key={k}>{k}</li>)}
-                            </ul>
-                          </div>
-                        ) : (
-                          <div className="text-slate-700">
-                            <div><span className="text-slate-500">HTTP status:</span> {yoloDebug.status ?? "—"} {yoloDebug.ok === false ? "(not ok)" : yoloDebug.ok === true ? "(ok)" : ""}</div>
-                            <div><span className="text-slate-500">Parse path:</span> {yoloDebug.parse_path ?? "—"}</div>
-                            <div><span className="text-slate-500">Parsed count:</span> {typeof yoloDebug.parsed_count === "number" ? yoloDebug.parsed_count : "—"}</div>
-                            {yoloDebug.error && <div className="text-amber-700">Error: {String(yoloDebug.error)}</div>}
-                            {yoloDebug.body_snippet && (
-                              <div className="mt-1">
-                                <div className="text-slate-500">Body (first 240 chars):</div>
-                                <pre className="whitespace-pre-wrap break-words rounded border bg-white/60 p-2 text-[11px]">{yoloDebug.body_snippet}</pre>
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    ) : (
-                      <div className="text-slate-500">No server debug info.</div>
-                    )}
-
-                    {/* Client-side detect issues */}
-                    {detectIssues?.length ? (
-                      <div className="text-amber-700">
-                        <div className="font-medium">Detect issues:</div>
-                        <ul className="list-disc ml-5">
-                          {detectIssues.map((v, i) => <li key={i}>{v}</li>)}
-                        </ul>
-                      </div>
-                    ) : (
-                      <div className="text-slate-500">No detect issues reported.</div>
-                    )}
-
-                    {/* Boxes list */}
-                    <div className="text-slate-700">
-                      <div className="font-medium">Boxes (first 5):</div>
-                      {yoloBoxes.length ? (
-                        <ul className="ml-5 list-disc">
-                          {yoloBoxes.slice(0, 5).map((b, i) => (
-                            <li key={i}>
-                              bbox_rel=[{b.bbox_rel.map(n => n.toFixed(3)).join(", ")}], conf={Math.round(b.confidence * 100)}%
-                            </li>
-                          ))}
-                        </ul>
-                      ) : (
-                        <div className="text-slate-500">[] (Roboflow returned no boxes)</div>
-                      )}
-                    </div>
+                {detectIssues?.length ? (
+                  <div className="mt-2 text-amber-700 text-[12px]">
+                    <div className="font-medium">Detect issues:</div>
+                    <ul className="list-disc ml-5">
+                      {detectIssues.map((v, i) => <li key={i}>{v}</li>)}
+                    </ul>
                   </div>
-                </details>
+                ) : null}
               </div>
             </div>
 

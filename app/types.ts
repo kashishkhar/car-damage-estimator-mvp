@@ -19,37 +19,6 @@ export type Vehicle = {
 export type ApiError = { error: string; error_code?: string };
 
 /* ──────────────────────────────────────────────────────────────────────────
- * Roboflow debug block (used only in debug UIs)
- * ------------------------------------------------------------------------ */
-
-/** Narrow, explicit shape for the optional debug payload returned by detect. */
-export type RoboflowDebug = {
-  enabled: boolean;
-  /** Missing required env vars on the server (if any). */
-  missing_env?: string[];
-  /** Fully-resolved Roboflow request URL (with query params). */
-  rf_url?: string;
-  /** HTTP status returned by Roboflow. */
-  status?: number;
-  /** Convenience mirror of status in boolean form. */
-  ok?: boolean;
-  /** First 240 chars of the raw response body for quick inspection. */
-  body_snippet?: string;
-  /** Where predictions were parsed from in the response object. */
-  parse_path?: "predictions" | "result.predictions" | "outputs" | "none";
-  /** Number of predictions parsed (post-filter). */
-  parsed_count?: number;
-  /** Any parse/network error string captured by the server. */
-  error?: string;
-  /** Parameters actually sent (confidence/overlap); "(default)" if omitted. */
-  params?: { confidence: string; overlap: string };
-  /** How the image was sent to Roboflow. */
-  sent_mode?: "base64_body" | "image_query";
-  /** Top-level image dimensions if provided by Roboflow. */
-  image_dims?: { width: number | null; height: number | null };
-};
-
-/* ──────────────────────────────────────────────────────────────────────────
  * Detect route payload
  * ------------------------------------------------------------------------ */
 
@@ -63,8 +32,7 @@ export type DetectPayload = {
   has_damage: boolean;  // inferred: yolo_boxes.length > 0
   quality_ok: boolean;  // usable image?
   issues: string[];     // e.g., ["blurry","low_light"]
-  /** Optional debug info from Roboflow (only present when enabled server-side). */
-  yolo_debug?: RoboflowDebug;
+  yolo_debug?: any;     // optional debug info from Roboflow
 };
 
 /* ──────────────────────────────────────────────────────────────────────────
