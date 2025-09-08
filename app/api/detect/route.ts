@@ -24,16 +24,14 @@ export const runtime = "nodejs";
 const MODEL_VEHICLE = process.env.MODEL_VEHICLE || "gpt-4o-mini"; // small/fast classifier
 
 // Roboflow settings (optional; this route tolerates empty keys)
-// - MODEL / VERSION select the hosted inference endpoint
-// - CONF / OVERLAP are pass-through thresholds (safe to omit → provider defaults)
 const ROBOFLOW_API_KEY = process.env.ROBOFLOW_API_KEY || "";
 const ROBOFLOW_MODEL = process.env.ROBOFLOW_MODEL || "";
 const ROBOFLOW_VERSION = process.env.ROBOFLOW_VERSION || "";
-const ROBOFLOW_CONF = process.env.ROBOFLOW_CONF ?? "";       // e.g., "0.10"
-const ROBOFLOW_OVERLAP = process.env.ROBOFLOW_OVERLAP ?? ""; // e.g., "0.30"
+const ROBOFLOW_CONF = process.env.ROBOFLOW_CONF ?? "";
+const ROBOFLOW_OVERLAP = process.env.ROBOFLOW_OVERLAP ?? "";
 
 /* ──────────────────────────────────────────────────────────────────────────
- * OpenAI client (lazy init)
+ * OpenAI client (lazy)
  * ------------------------------------------------------------------------ */
 
 let _openai: OpenAI | null = null;
@@ -49,6 +47,8 @@ function getOpenAI(): OpenAI {
  * Utilities
  * ------------------------------------------------------------------------ */
 
+type UnknownRecord = Record<string, unknown>;
+
 function getNum(obj: Record<string, unknown>, key: string): number | undefined {
   return typeof obj[key] === "number" ? (obj[key] as number) : undefined;
 }
@@ -56,77 +56,133 @@ function getNum(obj: Record<string, unknown>, key: string): number | undefined {
 function sha256(buf: Buffer) { return crypto.createHash("sha256").update(buf).digest("hex"); }
 function sha256String(s: string) { return crypto.createHash("sha256").update(s, "utf8").digest("hex"); }
 
-/** Best-effort extraction across Roboflow response variants (predictions array may live in different roots). */
+/** Best-effort extraction across Roboflow response variants. */
 function extractPredictions(obj: unknown): unknown[] {
   if (!isRecord(obj)) return [];
-  if (Array.isArray(obj.predictions)) return obj.predictions as unknown[];
-  if (isRecord(obj.result) && Array.isArray(obj.result.predictions)) return obj.result.predictions as unknown[];
-  if (Array.isArray(obj.outputs)) return obj.outputs as unknown[];
+  if (Array.isArray((obj as UnknownRecord).predictions)) return (obj as UnknownRecord).predictions as unknown[];
+  if (
+    isRecord((obj as UnknownRecord).result) &&
+    Array.isArray(((obj as UnknownRecord).result as UnknownRecord).predictions)
+  ) {
+    return ((obj as UnknownRecord).result as UnknownRecord).predictions as unknown[];
+  }
+  if (Array.isArray((obj as UnknownRecord).outputs)) return (obj as UnknownRecord).outputs as unknown[];
   return [];
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
- * Roboflow: Hosted inference → normalized YOLO boxes
- * ------------------------------------------------------------------------
- * Behavior:
- * - Uploads: POST raw base64 in body (strip "data:*;base64," prefix). No ?image= key.
- * - URLs:    POST with ?image=<http(s)://...> on the query string; empty body.
- * - Normalization: predictions may return pixel-space (x,y,width,height) with
- *   image dims only at the top-level ({ image: { width, height }}). We normalize
- *   to [0..1] using per-pred dims if present, else the global image dims.
- * - Tuning: optional confidence/overlap envs are appended to the request URL.
+ * Roboflow: Hosted inference → normalized YOLO boxes (with debug)
  * ------------------------------------------------------------------------ */
 
-async function detectWithRoboflow(imageUrlOrDataUrl: string): Promise<YoloBoxRel[]> {
-  // Tolerate missing keys → feature is optional
-  if (!ROBOFLOW_API_KEY || !ROBOFLOW_MODEL || !ROBOFLOW_VERSION) return [];
+type RoboflowDebug = {
+  enabled: boolean;
+  missing_env?: string[];
+  rf_url?: string;
+  status?: number;
+  ok?: boolean;
+  body_snippet?: string;
+  parse_path?: "predictions" | "result.predictions" | "outputs" | "none";
+  parsed_count?: number;
+  error?: string;
+  params?: { confidence: string; overlap: string };
+  sent_mode?: "base64_body" | "image_query";
+  image_dims?: { width: number | null; height: number | null };
+};
 
-  // Build base URL with API key + optional threshold knobs
-  let baseUrl = `https://detect.roboflow.com/${ROBOFLOW_MODEL}/${ROBOFLOW_VERSION}?api_key=${ROBOFLOW_API_KEY}`;
-  if (ROBOFLOW_CONF)    baseUrl += `&confidence=${encodeURIComponent(ROBOFLOW_CONF)}`;
-  if (ROBOFLOW_OVERLAP) baseUrl += `&overlap=${encodeURIComponent(ROBOFLOW_OVERLAP)}`;
+async function detectWithRoboflowDebug(imageUrlOrDataUrl: string): Promise<{ boxes: YoloBoxRel[]; debug: RoboflowDebug; }> {
+  const debug: RoboflowDebug = { enabled: true };
+  const boxes: YoloBoxRel[] = [];
 
-  // Decide request shape
-  let url = baseUrl;
-  let body: string | undefined;
-  let headers: Record<string, string> = {};
-
-  if (imageUrlOrDataUrl.startsWith("data:")) {
-    // Base64 upload: body = raw b64 (strip "data:*;base64,")
-    const comma = imageUrlOrDataUrl.indexOf(",");
-    const rawB64 = comma >= 0 ? imageUrlOrDataUrl.slice(comma + 1) : imageUrlOrDataUrl;
-    body = rawB64;
-    headers["Content-Type"] = "application/x-www-form-urlencoded";
-  } else {
-    // Hosted URL: pass via query string (?image=...)
-    url = `${baseUrl}&image=${encodeURIComponent(imageUrlOrDataUrl)}`;
+  // ENV guard
+  const missing: string[] = [];
+  if (!ROBOFLOW_API_KEY) missing.push("ROBOFLOW_API_KEY");
+  if (!ROBOFLOW_MODEL) missing.push("ROBOFLOW_MODEL");
+  if (!ROBOFLOW_VERSION) missing.push("ROBOFLOW_VERSION");
+  if (missing.length) {
+    debug.missing_env = missing;
+    return { boxes, debug };
   }
 
   try {
+    // Build the base URL and apply optional tuning
+    let baseUrl = `https://detect.roboflow.com/${ROBOFLOW_MODEL}/${ROBOFLOW_VERSION}?api_key=${ROBOFLOW_API_KEY}`;
+
+    if (ROBOFLOW_CONF)    baseUrl += `&confidence=${encodeURIComponent(ROBOFLOW_CONF)}`;
+    if (ROBOFLOW_OVERLAP) baseUrl += `&overlap=${encodeURIComponent(ROBOFLOW_OVERLAP)}`;
+
+    // record params for client debug panel
+    debug.params = {
+      confidence: ROBOFLOW_CONF || "(default)",
+      overlap: ROBOFLOW_OVERLAP || "(default)",
+    };
+
+    // Decide request shape
+    let url = baseUrl;
+    let body: string | undefined;
+    const headers: Record<string, string> = {};
+    let sent_mode: RoboflowDebug["sent_mode"] = undefined;
+
+    if (imageUrlOrDataUrl.startsWith("data:")) {
+      // Base64 uploads → body must be raw base64 (strip data: header)
+      const comma = imageUrlOrDataUrl.indexOf(",");
+      const rawB64 = comma >= 0 ? imageUrlOrDataUrl.slice(comma + 1) : imageUrlOrDataUrl;
+      body = rawB64;
+      headers["Content-Type"] = "application/x-www-form-urlencoded";
+      sent_mode = "base64_body";
+    } else {
+      // Hosted image URL → goes on the query string
+      url = `${baseUrl}&image=${encodeURIComponent(imageUrlOrDataUrl)}`;
+      sent_mode = "image_query";
+    }
+
+    debug.rf_url = url;
+    debug.sent_mode = sent_mode;
+
     const res = await fetch(url, { method: "POST", headers, body });
-    if (!res.ok) return []; // soft-fail → no boxes
+
+    debug.status = res.status;
+    debug.ok = res.ok;
+
     const text = await res.text();
+    debug.body_snippet = text.slice(0, 240);
 
-    // Parse JSON (tolerate parse failure → no boxes)
+    if (!res.ok) return { boxes, debug };
+
+    // Parse, extract predictions, normalize to [0..1] boxes
     let parsed: unknown;
-    try { parsed = JSON.parse(text); } catch { return []; }
+    try { parsed = JSON.parse(text); } catch {
+      debug.error = "json_parse_failed";
+      return { boxes, debug };
+    }
 
-    // Top-level image dims fallback: { image: { width, height } }
-    const imgRec = isRecord(parsed) && isRecord((parsed as any).image)
-      ? ((parsed as any).image as Record<string, unknown>)
+    // Grab global image dimensions if present: { image: { width, height } }
+    const imgObj = isRecord(parsed) && isRecord((parsed as UnknownRecord).image)
+      ? ((parsed as UnknownRecord).image as UnknownRecord)
       : {};
-    const globalW = getNum(imgRec, "width");
-    const globalH = getNum(imgRec, "height");
+    const globalW = getNum(imgObj, "width");
+    const globalH = getNum(imgObj, "height");
+    debug.image_dims = { width: globalW ?? null, height: globalH ?? null };
 
-    // Extract predictions across possible shapes
-    const rawPreds = extractPredictions(parsed);
-    const preds = rawPreds.filter(isRecord) as Record<string, unknown>[];
+    let path: RoboflowDebug["parse_path"] = "none";
+    const raw = extractPredictions(parsed);
+    if (Array.isArray(raw)) {
+      if (Array.isArray((parsed as UnknownRecord).predictions)) path = "predictions";
+      else if (
+        isRecord((parsed as UnknownRecord).result) &&
+        Array.isArray(((parsed as UnknownRecord).result as UnknownRecord).predictions)
+      ) path = "result.predictions";
+      else if (Array.isArray((parsed as UnknownRecord).outputs)) path = "outputs";
+    }
+    debug.parse_path = path;
 
-    const boxes: YoloBoxRel[] = [];
+    const preds = raw.filter(isRecord) as Record<string, unknown>[];
+    debug.parsed_count = preds.length;
+
     for (const p of preds) {
       const conf = getNum(p, "confidence") ?? getNum(p, "conf") ?? 0.5;
 
-      // Preferred center format (pixels) → normalize using per-pred dims OR global dims
+      // Preferred: center (x,y) + size (width,height) in pixels, normalize by image dims.
+      // Use per-pred image_width/image_height if present, else fallback to top-level image.width/height.
       const pxW = getNum(p, "image_width") ?? globalW;
       const pxH = getNum(p, "image_height") ?? globalH;
 
@@ -142,16 +198,16 @@ async function detectWithRoboflow(imageUrlOrDataUrl: string): Promise<YoloBoxRel
         const W  = pxW as number;
         const H  = pxH as number;
 
-        // Convert center-format pixels → normalized [x,y,w,h] origin at top-left
         const nx = Math.max(0, Math.min(1, (cx - w / 2) / W));
         const ny = Math.max(0, Math.min(1, (cy - h / 2) / H));
         const nw = Math.max(0, Math.min(1, w / W));
         const nh = Math.max(0, Math.min(1, h / H));
+
         boxes.push({ bbox_rel: [nx, ny, nw, nh], confidence: conf! });
         continue;
       }
 
-      // Fallback: min/max corners (already normalized in [0..1] space)
+      // Fallback min/max normalized
       if (
         getNum(p, "x_min") !== undefined && getNum(p, "x_max") !== undefined &&
         getNum(p, "y_min") !== undefined && getNum(p, "y_max") !== undefined
@@ -169,19 +225,15 @@ async function detectWithRoboflow(imageUrlOrDataUrl: string): Promise<YoloBoxRel
       }
     }
 
-    return boxes;
-  } catch {
-    // Network/timeout/etc → treat as "no detections"
-    return [];
+    return { boxes, debug };
+  } catch (e: unknown) {
+    debug.error = e instanceof Error ? e.message : "roboflow_call_failed";
+    return { boxes, debug };
   }
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
  * OpenAI quick gate: Vehicle present? Quality OK?
- * ------------------------------------------------------------------------
- * Returns a conservative JSON gate to avoid analyzing unusable images.
- * - "issues" may include blur/occlusion/low_light/etc. (best-effort)
- * - "vehicle_guess" is a lightweight hint; UI uses it as metadata.
  * ------------------------------------------------------------------------ */
 
 async function quickQualityGate(imageUrlOrDataUrl: string): Promise<{
@@ -223,7 +275,6 @@ Rules:
     ],
   });
 
-  // Parse model JSON (fallbacks are deliberately permissive)
   let parsed: unknown = {};
   try {
     parsed = JSON.parse(completion.choices?.[0]?.message?.content ?? "{}");
@@ -236,8 +287,8 @@ Rules:
     };
   }
 
-  const pv = (typeof parsed === "object" && parsed !== null ? parsed : {}) as Record<string, unknown>;
-  const vehicleObj = (pv["vehicle"] && typeof pv["vehicle"] === "object" ? (pv["vehicle"] as Record<string, unknown>) : {});
+  const pv = (typeof parsed === "object" && parsed !== null ? parsed : {}) as UnknownRecord;
+  const vehicleObj = (pv["vehicle"] && typeof pv["vehicle"] === "object" ? (pv["vehicle"] as UnknownRecord) : {});
 
   const vehicle_guess: Vehicle = {
     make: typeof vehicleObj["make"] === "string" ? (vehicleObj["make"] as string) : null,
@@ -256,17 +307,6 @@ Rules:
 
 /* ──────────────────────────────────────────────────────────────────────────
  * POST /api/detect
- * ------------------------------------------------------------------------
- * Input:
- * - multipart/form-data containing either:
- *   • file: File (image/*)
- *   • imageUrl: string (http/https)
- *
- * Output (DetectPayload):
- * - yolo_boxes: normalized YOLO boxes from Roboflow (may be empty)
- * - vehicle / is_vehicle / quality_ok: quick gate hints
- * - issues: best-effort quality issues (array of strings)
- * - has_damage: inferred from yolo_boxes.length > 0 (UX hint)
  * ------------------------------------------------------------------------ */
 
 export async function POST(req: NextRequest) {
@@ -280,7 +320,7 @@ export async function POST(req: NextRequest) {
       return errJson("No file or imageUrl provided", ERR.NO_IMAGE, 400);
     }
 
-    // Build a safe source URL (data: for uploads; http(s) passthrough for links) + audit hash
+    // Build a safe source URL and an audit hash (consistent with /api/analyze).
     let imageSourceUrl: string;
     let imageHash: string;
 
@@ -300,13 +340,22 @@ export async function POST(req: NextRequest) {
       imageHash = sha256String(imageUrl!);
     }
 
-    // Run Roboflow detection + OpenAI quick gate in parallel
-    const [yolo_boxes, q] = await Promise.all([
-      detectWithRoboflow(imageSourceUrl),
+    // Run Roboflow detection + OpenAI quick gate in parallel.
+    const [rf, q] = await Promise.all([
+      detectWithRoboflowDebug(imageSourceUrl),
       quickQualityGate(imageSourceUrl),
     ]);
 
-    const payload: DetectPayload = {
+    const yolo_boxes = rf.boxes;
+
+    // Merge quick gate issues with detect status
+    const issues = q.issues.slice();
+    if ((rf.debug?.parsed_count ?? 0) === 0) {
+      issues.push("no_yolo_detections");
+    }
+
+    // Build response payload (include debug for client UI)
+    const payload: DetectPayload & { yolo_debug?: RoboflowDebug } = {
       model: MODEL_VEHICLE,
       runId: crypto.randomUUID(),
       image_sha256: imageHash,
@@ -315,7 +364,8 @@ export async function POST(req: NextRequest) {
       is_vehicle: q.is_vehicle,
       has_damage: yolo_boxes.length > 0,
       quality_ok: q.quality_ok,
-      issues: q.issues,
+      issues,
+      yolo_debug: rf.debug,
     };
 
     console.timeEnd("detect_total");
