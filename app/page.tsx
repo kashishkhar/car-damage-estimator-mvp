@@ -165,6 +165,112 @@ function CanvasOverlay({ imgRef, items, show }: { imgRef: React.RefObject<HTMLIm
   return <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none" aria-hidden="true" />;
 }
 
+function YoloCanvasOverlay({
+  imgRef,
+  boxes,
+  show,
+}: {
+  imgRef: React.RefObject<HTMLImageElement>;
+  boxes: YoloBoxRel[];
+  show: boolean;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const img = imgRef.current;
+    const canvas = canvasRef.current;
+    if (!img || !canvas) return;
+
+    // Position canvas exactly over the <img> element box
+    const parent = canvas.parentElement as HTMLElement | null;
+    const imgRect = img.getBoundingClientRect();
+    const parentRect = parent?.getBoundingClientRect();
+
+    const left = parentRect ? imgRect.left - parentRect.left : 0;
+    const top  = parentRect ? imgRect.top  - parentRect.top  : 0;
+    const cssW = imgRect.width;
+    const cssH = imgRect.height;
+
+    canvas.style.position = "absolute";
+    canvas.style.left = `${left}px`;
+    canvas.style.top = `${top}px`;
+    canvas.style.width = `${cssW}px`;
+    canvas.style.height = `${cssH}px`;
+    canvas.style.pointerEvents = "none";
+
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    // CLEAR
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!show || cssW <= 0 || cssH <= 0) return;
+
+    // ----- LETTERBOX COMPENSATION (object-contain) -----
+    // Compute the inner drawn bitmap rect inside the <img> element
+    const naturalW = img.naturalWidth || cssW;
+    const naturalH = img.naturalHeight || cssH;
+
+    const scale = Math.min(cssW / naturalW, cssH / naturalH);
+    const renderedW = naturalW * scale;
+    const renderedH = naturalH * scale;
+    const offsetX = (cssW - renderedW) / 2;
+    const offsetY = (cssH - renderedH) / 2;
+
+    // Draw in CSS pixel space; account for HiDPI
+    ctx.scale(dpr, dpr);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#10b981";
+    ctx.fillStyle = "rgba(16,185,129,0.2)";
+    ctx.font = "12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
+    ctx.textBaseline = "top";
+
+    boxes.forEach(({ bbox_rel: [nx, ny, nw, nh], confidence }) => {
+      const x = offsetX + nx * renderedW;
+      const y = offsetY + ny * renderedH;
+      const w = nw * renderedW;
+      const h = nh * renderedH;
+
+      ctx.beginPath();
+      ctx.rect(x, y, w, h);
+      ctx.fill();
+      ctx.stroke();
+
+      // label pill
+      const label = `${Math.round(confidence * 100)}%`;
+      const pad = 4, lh = 16;
+      const tw = ctx.measureText(label).width + pad * 2;
+      const ly = Math.max(0, y - lh - 2);
+      ctx.fillStyle = "rgba(0,0,0,0.75)";
+      ctx.fillRect(x, ly, tw, lh);
+      ctx.fillStyle = "#fff";
+      ctx.fillText(label, x + pad, ly + 2);
+
+      // restore fill color for next rect
+      ctx.fillStyle = "rgba(16,185,129,0.2)";
+    });
+
+    // Re-render when the image resizes (e.g., responsive layout)
+    const ro = new ResizeObserver(() => {
+      canvas.style.width = `${img.getBoundingClientRect().width}px`;
+      requestAnimationFrame(() => { /* noop to trigger paint */ });
+    });
+    ro.observe(img);
+
+    return () => {
+      ro.disconnect();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    };
+  }, [imgRef, boxes, show]);
+
+  return <canvas ref={canvasRef} aria-hidden="true" />;
+}
+
 async function overlaySnapshot(src: string, items: DamageItem[], targetW = 1200) {
   const img = await loadImage(src);
   const scale = Math.min(1, targetW / img.naturalWidth);
@@ -192,6 +298,40 @@ async function overlaySnapshot(src: string, items: DamageItem[], targetW = 1200)
       label(ctx, String(d.part ?? ""), x + ww / 2, y + 14, color);
     }
   });
+  return canvas.toDataURL("image/jpeg", 0.92);
+}
+
+// Helper for print logic
+async function overlaySnapshotYolo(src: string, boxes: YoloBoxRel[], targetW = 1200) {
+  const img = await loadImage(src);
+  const scale = Math.min(1, targetW / img.naturalWidth);
+  const w = Math.round(img.naturalWidth * scale), h = Math.round(img.naturalHeight * scale);
+  const canvas = document.createElement("canvas"); canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext("2d")!;
+  ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, w, h);
+  ctx.drawImage(img, 0, 0, w, h);
+
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "#10b981";
+  ctx.fillStyle = "rgba(16,185,129,0.2)";
+
+  boxes.forEach(({ bbox_rel: [nx, ny, nw, nh], confidence }) => {
+    const x = nx * w, y = ny * h, ww = nw * w, hh = nh * h;
+    ctx.beginPath(); ctx.rect(x, y, ww, hh); ctx.fill(); ctx.stroke();
+
+    const label = `${Math.round(confidence * 100)}%`;
+    const pad = 4, lh = 16;
+    const tw = ctx.measureText(label).width + pad * 2;
+    ctx.fillStyle = "rgba(0,0,0,0.75)";
+    ctx.fillRect(x, Math.max(0, y - lh - 2), tw, lh);
+    ctx.fillStyle = "#fff";
+    ctx.font = "12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
+    ctx.textBaseline = "top";
+    ctx.fillText(label, x + pad, Math.max(0, y - lh - 2) + 2);
+
+    ctx.fillStyle = "rgba(16,185,129,0.2)";
+  });
+
   return canvas.toDataURL("image/jpeg", 0.92);
 }
 
@@ -392,6 +532,10 @@ export default function Home() {
   const [error, setError] = useState("");
   const [validationIssues, setValidationIssues] = useState<string[] | null>(null);
 
+  // YOLO overlay + detect issues
+  const [yoloBoxes, setYoloBoxes] = useState<YoloBoxRel[]>([]);
+  const [detectIssues, setDetectIssues] = useState<string[] | null>(null);
+
   // Toggles
   const [showOverlay, setShowOverlay] = useState(true);
   const [showAudit, setShowAudit] = useState(false);
@@ -424,7 +568,7 @@ export default function Home() {
 
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
-    setLoading(true); setError(""); setValidationIssues(null); setResult(null);
+    setLoading(true); setError(""); setValidationIssues(null); setResult(null); setYoloBoxes([]); setDetectIssues(null);
 
     try {
       const analyzeForm = new FormData(), detectForm = new FormData();
@@ -451,6 +595,16 @@ export default function Home() {
       if (detectJson && detectJson.is_vehicle === false) {
         setError("We couldn’t detect a vehicle in that image. Please upload a photo that clearly shows a vehicle.");
         return;
+      }
+
+      // Save YOLO boxes for overlays + detect issues for UI
+      const boxes = Array.isArray(detectJson?.yolo_boxes)
+        ? (detectJson.yolo_boxes as unknown[]).filter(isYoloBoxRel) as YoloBoxRel[]
+        : [];
+      setYoloBoxes(boxes);
+
+      if (Array.isArray(detectJson?.issues) && detectJson.issues.length) {
+        setDetectIssues(detectJson.issues.map(String));
       }
 
       // 2) ANALYZE – pass YOLO boxes as seeds if present (typed, guarded)
@@ -532,16 +686,22 @@ export default function Home() {
   const handlePrint = useCallback(async () => {
     try {
       if (preview) {
-        if (result?.damage_items?.length) {
+        if (yoloBoxes.length > 0) {
+          try { setSnapshotUrl(await overlaySnapshotYolo(preview, yoloBoxes)); }
+          catch { setSnapshotUrl(preview); }
+        } else if (result?.damage_items?.length) {
+          // fallback to legacy LLM snapshot if needed
           try { setSnapshotUrl(await overlaySnapshot(preview, result.damage_items)); }
           catch { setSnapshotUrl(preview); }
-        } else { setSnapshotUrl(preview); }
+        } else {
+          setSnapshotUrl(preview);
+        }
         setTimeout(() => window.print(), 50);
         return;
       }
     } catch {}
     window.print();
-  }, [preview, result]);
+  }, [preview, result, yoloBoxes]);  
 
   const samples = [
     { url: "https://images.pexels.com/photos/11985216/pexels-photo-11985216.jpeg" },
@@ -635,7 +795,7 @@ export default function Home() {
 
               <div aria-live="polite">
                 {error && (<div className="rounded-lg border border-rose-200/70 bg-rose-50/80 p-3 text-sm text-rose-700">{String(error)}</div>)}
-                </div>
+              </div>
 
               <div className="pt-1 flex flex-col gap-2">
                 <Checkbox id="overlay" checked={showOverlay} onChange={setShowOverlay} label="Show damage overlay" />
@@ -650,8 +810,12 @@ export default function Home() {
                 {preview ? (
                   <>
                     <img ref={imgRef} src={preview} alt="preview" className="w-full rounded-lg border border-slate-200 max-h-[360px] object-contain bg-slate-50" />
-                    {result?.damage_items && showOverlay && (
-                      <CanvasOverlay imgRef={imgRef as React.RefObject<HTMLImageElement>} items={result.damage_items} show={showOverlay} />
+                    {showOverlay && (
+                      <YoloCanvasOverlay
+                        imgRef={imgRef as React.RefObject<HTMLImageElement>}
+                        boxes={yoloBoxes}
+                        show={showOverlay}
+                      />
                     )}
                   </>
                 ) : (
@@ -659,6 +823,24 @@ export default function Home() {
                     {mode === "upload" ? "Upload a photo to begin" : "Paste an image URL to preview"}
                   </div>
                 )}
+              </div>
+
+              {/* Overlay source + (optional) detect issues */}
+              <div className="mt-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] rounded border border-emerald-300 bg-emerald-50 px-2 py-0.5 text-emerald-700">
+                    overlay: YOLO ({yoloBoxes.length})
+                  </span>
+                </div>
+
+                {detectIssues?.length ? (
+                  <div className="mt-2 text-amber-700 text-[12px]">
+                    <div className="font-medium">Detect issues:</div>
+                    <ul className="list-disc ml-5">
+                      {detectIssues.map((v, i) => <li key={i}>{v}</li>)}
+                    </ul>
+                  </div>
+                ) : null}
               </div>
             </div>
 
@@ -870,7 +1052,7 @@ export default function Home() {
                           <div className="text-sm font-medium text-slate-900">Labor</div>
                           <div className="mt-1 text-[13px] text-slate-700">
                             {hoursStr} = <span className="font-medium">${bd.labor.toLocaleString()}</span>
-            </div>
+                          </div>
                         </div>
 
                         {/* Row 2: Paint & Materials */}
@@ -878,13 +1060,13 @@ export default function Home() {
                           <div className="text-sm font-medium text-slate-900">Paint &amp; Materials</div>
                           <div className="mt-1 text-[13px] text-slate-700">
                             {zonesStr} = <span className="font-medium">${bd.paint.toLocaleString()}</span>
-              </div>
+                          </div>
                           {paintedZoneCount > 0 && (
                             <div className="mt-1 text-[12px] text-slate-500">
                               Paint is applied once per affected zone to avoid double-charging overlapping work.
-            </div>
-          )}
-      </div>
+                            </div>
+                          )}
+                        </div>
 
                         {/* Row 3: Parts */}
                         <div className="rounded-xl border border-slate-200 bg-white/70 p-3">
@@ -896,13 +1078,13 @@ export default function Home() {
                                 {bd.parts_detail.length} part{bd.parts_detail.length === 1 ? "" : "s"} ={" "}
                                 <span className="font-medium">${bd.parts.toLocaleString()}</span>
                                 <span className="ml-2 text-[11px] text-slate-500">(dynamic)</span>
-        </div>
+                              </div>
                               <ul className="mt-1 text-[12px] text-slate-600 space-y-0.5">
                                 {bd.parts_detail.slice(0, 10).map((p, i) => (
                                   <li key={i} className="flex items-center justify-between gap-3">
                                     <span className="truncate">{p.name} × {p.qty}</span>
                                     <span className="whitespace-nowrap">
-                                      ${p.unit_price} = ${(p.line_total).toLocaleString()}
+                                      ${p.unit_price} = {(p.line_total).toLocaleString()}
                                     </span>
                                   </li>
                                 ))}
@@ -917,7 +1099,7 @@ export default function Home() {
                               <span className="ml-2 text-[11px] text-slate-500">
                                 {bd.dynamic_parts_used ? "(dynamic)" : "(baseline)"}
                               </span>
-      </div>
+                            </div>
                           )}
                         </div>
 
@@ -925,11 +1107,11 @@ export default function Home() {
                         <div className="flex items-center justify-between mt-2">
                           <div className="text-sm text-slate-600">
                             Range: <span className="font-medium">${lo.toLocaleString()} – ${hi.toLocaleString()}</span>
-        </div>
+                          </div>
                           <div className={`text-lg font-semibold tracking-tight ${inBand ? "text-slate-900" : "text-amber-700"}`}>
                             Subtotal: ${subtotal.toLocaleString()}
-        </div>
-      </div>
+                          </div>
+                        </div>
                         {!inBand && (
                           <div className="text-[12px] text-amber-700">
                             Note: subtotal is outside the displayed band; variance or inputs may need adjustment.
@@ -952,7 +1134,7 @@ export default function Home() {
                 <div><span className="text-slate-500">Model:</span> {result.model ?? "—"}</div>
                 <div><span className="text-slate-500">runId:</span> {result.runId ?? "—"}</div>
                 <div className="truncate"><span className="text-slate-500">image_sha256:</span> {result.image_sha256 ?? "—"}</div>
-      </div>
+              </div>
             </div>
           )}
 
@@ -964,9 +1146,9 @@ export default function Home() {
             {(snapshotUrl || preview) && (
               <img src={snapshotUrl || preview} alt="Vehicle image" className="w-full h-auto border rounded mb-4" style={{ maxHeight: "9in", objectFit: "contain" }} />
             )}
-      </div>
+          </div>
         </section>
-    </div>
+      </div>
     </main>
   );
 }

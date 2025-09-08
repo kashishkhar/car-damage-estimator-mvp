@@ -1,6 +1,8 @@
 // app/api/analyze/route.ts
 // -------------------------------------------------------------------------------------------------
 // Car Damage Estimator — Analyze Route (server)
+// --------------------------------------------------------------------------------------
+// Responsibilities:
 // - Accepts an uploaded image (file) or a public image URL
 // - Calls OpenAI Vision to produce structured damage JSON
 // - Normalizes/repairs the JSON, computes estimate + routing, and returns payload

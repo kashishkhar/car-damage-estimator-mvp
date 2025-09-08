@@ -3,10 +3,10 @@
 // Car Damage Estimator — Detect Route (server)
 // --------------------------------------------------------------------------------------
 // Responsibilities:
-// 1) Accept image file or URL
-// 2) (Optional) Run Roboflow model to get lightweight YOLO-style boxes
-// 3) Run a fast OpenAI classifier: vehicle present? image quality OK? (usable?)
-// 4) Return a compact DetectPayload that feeds the /api/analyze step
+// - Accept image file or URL
+// - (Optional) Run Roboflow model to get lightweight YOLO-style boxes
+// - Run a fast OpenAI classifier: vehicle present? image quality OK? (usable?)
+// - Return a compact DetectPayload that feeds the /api/analyze step
 // --------------------------------------------------------------------------------------
 
 import { NextRequest, NextResponse } from "next/server";
@@ -24,12 +24,16 @@ export const runtime = "nodejs";
 const MODEL_VEHICLE = process.env.MODEL_VEHICLE || "gpt-4o-mini"; // small/fast classifier
 
 // Roboflow settings (optional; this route tolerates empty keys)
+// - MODEL / VERSION select the hosted inference endpoint
+// - CONF / OVERLAP are pass-through thresholds (safe to omit → provider defaults)
 const ROBOFLOW_API_KEY = process.env.ROBOFLOW_API_KEY || "";
 const ROBOFLOW_MODEL = process.env.ROBOFLOW_MODEL || "";
 const ROBOFLOW_VERSION = process.env.ROBOFLOW_VERSION || "";
+const ROBOFLOW_CONF = process.env.ROBOFLOW_CONF ?? "";       // e.g., "0.10"
+const ROBOFLOW_OVERLAP = process.env.ROBOFLOW_OVERLAP ?? ""; // e.g., "0.30"
 
 /* ──────────────────────────────────────────────────────────────────────────
- * OpenAI client (lazy)
+ * OpenAI client (lazy init)
  * ------------------------------------------------------------------------ */
 
 let _openai: OpenAI | null = null;
@@ -52,7 +56,7 @@ function getNum(obj: Record<string, unknown>, key: string): number | undefined {
 function sha256(buf: Buffer) { return crypto.createHash("sha256").update(buf).digest("hex"); }
 function sha256String(s: string) { return crypto.createHash("sha256").update(s, "utf8").digest("hex"); }
 
-/** Best-effort extraction across Roboflow response variants. */
+/** Best-effort extraction across Roboflow response variants (predictions array may live in different roots). */
 function extractPredictions(obj: unknown): unknown[] {
   if (!isRecord(obj)) return [];
   if (Array.isArray(obj.predictions)) return obj.predictions as unknown[];
@@ -63,39 +67,82 @@ function extractPredictions(obj: unknown): unknown[] {
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Roboflow: Hosted inference → normalized YOLO boxes
+ * ------------------------------------------------------------------------
+ * Behavior:
+ * - Uploads: POST raw base64 in body (strip "data:*;base64," prefix). No ?image= key.
+ * - URLs:    POST with ?image=<http(s)://...> on the query string; empty body.
+ * - Normalization: predictions may return pixel-space (x,y,width,height) with
+ *   image dims only at the top-level ({ image: { width, height }}). We normalize
+ *   to [0..1] using per-pred dims if present, else the global image dims.
+ * - Tuning: optional confidence/overlap envs are appended to the request URL.
  * ------------------------------------------------------------------------ */
 
 async function detectWithRoboflow(imageUrlOrDataUrl: string): Promise<YoloBoxRel[]> {
+  // Tolerate missing keys → feature is optional
   if (!ROBOFLOW_API_KEY || !ROBOFLOW_MODEL || !ROBOFLOW_VERSION) return [];
+
+  // Build base URL with API key + optional threshold knobs
+  let baseUrl = `https://detect.roboflow.com/${ROBOFLOW_MODEL}/${ROBOFLOW_VERSION}?api_key=${ROBOFLOW_API_KEY}`;
+  if (ROBOFLOW_CONF)    baseUrl += `&confidence=${encodeURIComponent(ROBOFLOW_CONF)}`;
+  if (ROBOFLOW_OVERLAP) baseUrl += `&overlap=${encodeURIComponent(ROBOFLOW_OVERLAP)}`;
+
+  // Decide request shape
+  let url = baseUrl;
+  let body: string | undefined;
+  let headers: Record<string, string> = {};
+
+  if (imageUrlOrDataUrl.startsWith("data:")) {
+    // Base64 upload: body = raw b64 (strip "data:*;base64,")
+    const comma = imageUrlOrDataUrl.indexOf(",");
+    const rawB64 = comma >= 0 ? imageUrlOrDataUrl.slice(comma + 1) : imageUrlOrDataUrl;
+    body = rawB64;
+    headers["Content-Type"] = "application/x-www-form-urlencoded";
+  } else {
+    // Hosted URL: pass via query string (?image=...)
+    url = `${baseUrl}&image=${encodeURIComponent(imageUrlOrDataUrl)}`;
+  }
+
   try {
-    const url = `https://detect.roboflow.com/${ROBOFLOW_MODEL}/${ROBOFLOW_VERSION}?api_key=${ROBOFLOW_API_KEY}`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ image: imageUrlOrDataUrl }).toString(),
-    });
-    if (!res.ok) return [];
-    const data: unknown = await res.json();
-    const rawPreds = extractPredictions(data);
+    const res = await fetch(url, { method: "POST", headers, body });
+    if (!res.ok) return []; // soft-fail → no boxes
+    const text = await res.text();
+
+    // Parse JSON (tolerate parse failure → no boxes)
+    let parsed: unknown;
+    try { parsed = JSON.parse(text); } catch { return []; }
+
+    // Top-level image dims fallback: { image: { width, height } }
+    const imgRec = isRecord(parsed) && isRecord((parsed as any).image)
+      ? ((parsed as any).image as Record<string, unknown>)
+      : {};
+    const globalW = getNum(imgRec, "width");
+    const globalH = getNum(imgRec, "height");
+
+    // Extract predictions across possible shapes
+    const rawPreds = extractPredictions(parsed);
     const preds = rawPreds.filter(isRecord) as Record<string, unknown>[];
 
     const boxes: YoloBoxRel[] = [];
     for (const p of preds) {
       const conf = getNum(p, "confidence") ?? getNum(p, "conf") ?? 0.5;
 
-      // Prefer normalized center format + dims
+      // Preferred center format (pixels) → normalize using per-pred dims OR global dims
+      const pxW = getNum(p, "image_width") ?? globalW;
+      const pxH = getNum(p, "image_height") ?? globalH;
+
       if (
         getNum(p, "x") !== undefined && getNum(p, "y") !== undefined &&
         getNum(p, "width") !== undefined && getNum(p, "height") !== undefined &&
-        getNum(p, "image_width") !== undefined && getNum(p, "image_height") !== undefined
+        pxW !== undefined && pxH !== undefined && pxW > 0 && pxH > 0
       ) {
         const cx = getNum(p, "x") as number;
         const cy = getNum(p, "y") as number;
-        const w = getNum(p, "width") as number;
-        const h = getNum(p, "height") as number;
-        const W = getNum(p, "image_width") as number;
-        const H = getNum(p, "image_height") as number;
+        const w  = getNum(p, "width") as number;
+        const h  = getNum(p, "height") as number;
+        const W  = pxW as number;
+        const H  = pxH as number;
 
+        // Convert center-format pixels → normalized [x,y,w,h] origin at top-left
         const nx = Math.max(0, Math.min(1, (cx - w / 2) / W));
         const ny = Math.max(0, Math.min(1, (cy - h / 2) / H));
         const nw = Math.max(0, Math.min(1, w / W));
@@ -104,7 +151,7 @@ async function detectWithRoboflow(imageUrlOrDataUrl: string): Promise<YoloBoxRel
         continue;
       }
 
-      // Fallback: min/max corners (already normalized)
+      // Fallback: min/max corners (already normalized in [0..1] space)
       if (
         getNum(p, "x_min") !== undefined && getNum(p, "x_max") !== undefined &&
         getNum(p, "y_min") !== undefined && getNum(p, "y_max") !== undefined
@@ -121,14 +168,20 @@ async function detectWithRoboflow(imageUrlOrDataUrl: string): Promise<YoloBoxRel
         boxes.push({ bbox_rel: [nx, ny, nw, nh], confidence: conf! });
       }
     }
+
     return boxes;
   } catch {
+    // Network/timeout/etc → treat as "no detections"
     return [];
   }
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
  * OpenAI quick gate: Vehicle present? Quality OK?
+ * ------------------------------------------------------------------------
+ * Returns a conservative JSON gate to avoid analyzing unusable images.
+ * - "issues" may include blur/occlusion/low_light/etc. (best-effort)
+ * - "vehicle_guess" is a lightweight hint; UI uses it as metadata.
  * ------------------------------------------------------------------------ */
 
 async function quickQualityGate(imageUrlOrDataUrl: string): Promise<{
@@ -170,6 +223,7 @@ Rules:
     ],
   });
 
+  // Parse model JSON (fallbacks are deliberately permissive)
   let parsed: unknown = {};
   try {
     parsed = JSON.parse(completion.choices?.[0]?.message?.content ?? "{}");
@@ -202,6 +256,17 @@ Rules:
 
 /* ──────────────────────────────────────────────────────────────────────────
  * POST /api/detect
+ * ------------------------------------------------------------------------
+ * Input:
+ * - multipart/form-data containing either:
+ *   • file: File (image/*)
+ *   • imageUrl: string (http/https)
+ *
+ * Output (DetectPayload):
+ * - yolo_boxes: normalized YOLO boxes from Roboflow (may be empty)
+ * - vehicle / is_vehicle / quality_ok: quick gate hints
+ * - issues: best-effort quality issues (array of strings)
+ * - has_damage: inferred from yolo_boxes.length > 0 (UX hint)
  * ------------------------------------------------------------------------ */
 
 export async function POST(req: NextRequest) {
@@ -215,7 +280,7 @@ export async function POST(req: NextRequest) {
       return errJson("No file or imageUrl provided", ERR.NO_IMAGE, 400);
     }
 
-    // Build a safe source URL and an audit hash (consistent with /api/analyze).
+    // Build a safe source URL (data: for uploads; http(s) passthrough for links) + audit hash
     let imageSourceUrl: string;
     let imageHash: string;
 
@@ -235,7 +300,7 @@ export async function POST(req: NextRequest) {
       imageHash = sha256String(imageUrl!);
     }
 
-    // Run Roboflow detection + OpenAI quick gate in parallel.
+    // Run Roboflow detection + OpenAI quick gate in parallel
     const [yolo_boxes, q] = await Promise.all([
       detectWithRoboflow(imageSourceUrl),
       quickQualityGate(imageSourceUrl),

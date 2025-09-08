@@ -32,6 +32,7 @@ export type DetectPayload = {
   has_damage: boolean;  // inferred: yolo_boxes.length > 0
   quality_ok: boolean;  // usable image?
   issues: string[];     // e.g., ["blurry","low_light"]
+  yolo_debug?: any;     // optional debug info from Roboflow
 };
 
 /* ──────────────────────────────────────────────────────────────────────────
