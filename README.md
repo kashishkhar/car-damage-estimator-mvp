@@ -132,3 +132,47 @@ pnpm dev
 4) Cost Calculation – Dynamic parts pricing, labor rate estimation, paint/materials, and contingency modeling.
 5) Business Logic – Routing decision engine applies thresholds (severity, confidence, cost) to classify as AUTO-APPROVE, INVESTIGATE, or SPECIALIST.
 6) Response – Returns a comprehensive JSON payload: vehicle metadata, damage items, narrative summary, cost bands with assumptions, and routing recommendation.
+
+## Reasoning behind tool choice
+Frontend: Next.js 13 + Tailwind CSS 
+- Next.js: Rapid prototyping with file upload, single-page UI, and serverless APIs in one repo. Instant deploys on Vercel with preview links.
+- Tailwind: Fastest way to build a clean, enterprise-style UI without design overhead. Keeps styles consistent and flexible.
+
+Backend: Next.js API Routes 
+- Single deployable: No extra infra, no CORS issues, shared env. Core APIs: 
+ - /api/detect → optional YOLO (Roboflow) detection + vehicle/quality gate 
+ - /api/analyze → Vision LLM → normalized JSON → cost engine + routing 
+- Guardrails: Confidence validation, normalization, and conservative defaults to ensure consistent outputs.
+
+AI / ML: OpenAI GPT-4o-mini Vision (+ optional YOLO seeding)
+- Vision model: Low-latency, lower-cost model that handles vehicle metadata + damage descriptors in one call. 
+- YOLO seeds: Bounding boxes (when available) provide spatial hints for the LLM. 
+- Fallbacks: Parts pricing banded by family; routing rules tunable via env variables. 
+
+Images: In-memory for MVP
+- Prototype: Images handled in-memory for speed and simplicity; no persistent storage. 
+- Scalability roadmap: Vercel Blob (for quick persistence) or Amazon S3 (enterprise-grade durability, auditability).
+
+Deployment: Vercel
+- Zero-ops: git push → preview → prod. Fast iteration loop.
+- Tight Next.js integration: Built-in image handling, env management, rollbacks. 
+
+Development: TypeScript + ESLint
+- Type safety: Prevents schema drift between LLM JSON and UI components. 
+- Linting/formatting: Keeps repo review-ready and interview-friendly.
+
+
+## Potential Improvements
+- Dual-Pass Auditor Flow: Add a second “auditor” LLM pass when confidence is low to repair JSON, reduce hallucinations, and align outputs to YOLO hints.
+- Adaptive Model Selection: Use smaller models (gpt-4o-mini) for simple cases; escalate to full gpt-4o only when confidence drops.
+- Multi-Image Normalization: Support multiple photo angles with geometric alignment; combine detections to improve coverage and reduce blind spots.
+- Regional Labor & Parts Rates: Integrate shop-specific rate cards or OEM catalogs for more realistic estimates across geographies.
+- Total Loss detection: Accurate detection for total loss on a vehicle.
+- Caching Layer: Re-use results for identical images (via SHA-256 hash) to avoid duplicate inference costs.
+- Persistent Storage: Migrate from in-memory handling to S3/Blob storage with lifecycle management, IAM roles, and auditability.
+- Monitoring & Observability: Metrics on latency, model error rates, pass/fail routing accuracy; alerts for SLA breaches.
+- VIN History & Integration: Cross-reference claimed damage against vehicle history.
+- Fraud Detection ML: Pattern recognition for staged accidents and inflated claims.
+- Predictive Analytics: Forecast claim costs based on vehicle age, mileage, and damage patterns.
+- Video Assessment: Real-time damage assessment from mobile video streams.
+- Webhook Architecture: Event-driven notifications for downstream systems (CRM, workflow tools).
