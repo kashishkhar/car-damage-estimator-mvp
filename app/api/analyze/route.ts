@@ -7,6 +7,7 @@
 // - Calls OpenAI Vision to produce structured damage JSON
 // - Normalizes/repairs the JSON, computes estimate + routing, and returns payload
 // - Adds dynamic parts pricing + detailed cost breakdown for UI explainer
+// - Business-guardrails: PDR heuristic for minor dents, parts sanity bands, and stable variance policy
 // -------------------------------------------------------------------------------------------------
 
 import { NextRequest, NextResponse } from "next/server";
@@ -25,7 +26,6 @@ const ERR = {
   MODEL_JSON: "E_MODEL_JSON",
   SERVER: "E_SERVER",
 } as const;
-
 type ErrorCode = (typeof ERR)[keyof typeof ERR];
 
 function errJson(message: string, code: ErrorCode, status = 400) {
@@ -34,22 +34,38 @@ function errJson(message: string, code: ErrorCode, status = 400) {
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Environment / Policy
+ * - Server values are mirrored by NEXT_PUBLIC_* on the client, where appropriate.
+ * - Defaults picked to be defensible in a carrier demo, not industry-final.
  * ------------------------------------------------------------------------ */
 const MODEL_ID = process.env.MODEL_VISION || "gpt-4o-mini";
 
-const LABOR_RATE = Number(process.env.LABOR_RATE ?? 95);
-const PAINT_PER_ZONE = Number(process.env.PAINT_MAT_COST ?? 180);
+const LABOR_RATE = Number(process.env.LABOR_RATE ?? 125);
+const PAINT_PER_PANEL = Number(process.env.PAINT_MAT_COST ?? 300);
 
-// Routing thresholds (mirrored by NEXT_PUBLIC_* on the client)
+// Routing thresholds
 const AUTO_MAX_COST = Number(process.env.AUTO_MAX_COST ?? 1500);
 const AUTO_MAX_SEVERITY = Number(process.env.AUTO_MAX_SEVERITY ?? 2);
 const AUTO_MIN_CONF = Number(process.env.AUTO_MIN_CONF ?? 0.75);
 const SPEC_MIN_COST = Number(process.env.SPECIALIST_MIN_COST ?? 5000);
 const SPEC_MIN_SEVERITY = Number(process.env.SPECIALIST_MIN_SEVERITY ?? 4);
 
-// Parts pricing controls
-const PARTS_BASE = Number(process.env.PARTS_BASE ?? 250);
+// Estimation policy knobs
+const LABOR_CORRECTION = Number(process.env.LABOR_CORRECTION ?? 1.4); // capture R&I/setup/omissions
+const BLEND_DISCOUNT = Number(process.env.BLEND_DISCOUNT ?? 0.6);     // lighter refinish for light scratch/chip
+
+// Contingency (hidden damage) policy
+const CONT_BASE = Number(process.env.CONTINGENCY_BASE ?? 0.10);
+const CONT_FRONT_HEAVY = Number(process.env.CONTINGENCY_FRONT_HEAVY ?? 0.10);
+const CONT_REAR_HEAVY  = Number(process.env.CONTINGENCY_REAR_HEAVY ?? 0.05);
+const CONT_MAX = Number(process.env.CONTINGENCY_MAX ?? 0.30);
+
+// Parts pricing
+const PARTS_BASE = Number(process.env.PARTS_BASE ?? 500);
 const PARTS_DYNAMIC = Number(process.env.PARTS_DYNAMIC ?? 0) === 1;
+
+// Variance policy (range band)
+const VARIANCE_BASE = Number(process.env.VARIANCE_BASE ?? 0.15);     // ±15% typical
+const VARIANCE_SEVERE = Number(process.env.VARIANCE_SEVERE ?? 0.25); // ±25% when severe/contingency present
 
 /* ──────────────────────────────────────────────────────────────────────────
  * OpenAI client (lazy init)
@@ -66,15 +82,9 @@ function getOpenAI(): OpenAI {
 /* ──────────────────────────────────────────────────────────────────────────
  * Utilities / guards
  * ------------------------------------------------------------------------ */
-function sha256(buf: Buffer) {
-  return crypto.createHash("sha256").update(buf).digest("hex");
-}
-function sha256String(s: string) {
-  return crypto.createHash("sha256").update(s, "utf8").digest("hex");
-}
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null;
-}
+function sha256(buf: Buffer) { return crypto.createHash("sha256").update(buf).digest("hex"); }
+function sha256String(s: string) { return crypto.createHash("sha256").update(s, "utf8").digest("hex"); }
+function isRecord(v: unknown): v is Record<string, unknown> { return typeof v === "object" && v !== null; }
 
 type BBoxRel = [number, number, number, number];
 type PolyRel = [number, number][];
@@ -83,22 +93,11 @@ function isBBoxRel(v: unknown): v is BBoxRel {
   return Array.isArray(v) && v.length === 4 && v.every((n) => typeof n === "number" && n >= 0 && n <= 1);
 }
 function isPolygonRel(v: unknown): v is PolyRel {
-  return (
-    Array.isArray(v) &&
-    v.length >= 3 &&
-    v.length <= 12 &&
-    v.every(
-      (pt) =>
-        Array.isArray(pt) &&
-        pt.length === 2 &&
-        typeof pt[0] === "number" &&
-        pt[0] >= 0 &&
-        pt[0] <= 1 &&
-        typeof pt[1] === "number" &&
-        pt[1] >= 0 &&
-        pt[1] <= 1
-    )
-  );
+  return Array.isArray(v)
+    && v.length >= 3 && v.length <= 12
+    && v.every((pt) => Array.isArray(pt) && pt.length === 2
+      && typeof pt[0] === "number" && pt[0] >= 0 && pt[0] <= 1
+      && typeof pt[1] === "number" && pt[1] >= 0 && pt[1] <= 1);
 }
 
 type YoloSeed = { bbox_rel: BBoxRel; confidence: number };
@@ -108,6 +107,9 @@ function isYoloSeed(v: unknown): v is YoloSeed {
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Bodyshop heuristics
+ * - hoursFor(): rough base hours by part, scaled by severity
+ * - needsPaintFor(): defaults to paint for sev≥2 except glass/lights
+ * - minorDentPDR(): PDR for side panels when severity ≤2 and type=dent
  * ------------------------------------------------------------------------ */
 function hoursFor(part: Part, sev: number) {
   const base =
@@ -127,16 +129,57 @@ function hoursFor(part: Part, sev: number) {
   const sevMult = sev <= 1 ? 0.5 : sev === 2 ? 0.8 : sev === 3 ? 1.0 : sev === 4 ? 1.4 : 1.8;
   return +(base * sevMult).toFixed(2);
 }
-
 function needsPaintFor(type: string, sev: number, part: Part) {
   if (["windshield", "headlight", "taillight", "mirror"].includes(part)) return false;
   if (type.includes("scratch") || type.includes("paint")) return true;
   return sev >= 2;
 }
+function minorDentPDR(d: DamageItem): { usePDR: boolean; adjHours: number; adjPaint: boolean } {
+  // PDR if: minor dent (sev ≤2), side panels, and damage_type = dent
+  const sidePanel = ["door", "fender", "quarter-panel"].includes(d.part);
+  const isMinorDent = d.damage_type === "dent" && d.severity <= 2;
+  if (sidePanel && isMinorDent) {
+    const base = typeof d.est_labor_hours === "number" ? d.est_labor_hours : hoursFor(d.part, d.severity);
+    const adjHours = Math.max(0.5, +(base * 0.6).toFixed(2)); // ~40% faster when PDR applies
+    return { usePDR: true, adjHours, adjPaint: false };
+  }
+  return { usePDR: false, adjHours: d.est_labor_hours, adjPaint: d.needs_paint };
+}
 
 /* ──────────────────────────────────────────────────────────────────────────
- * Dynamic parts pricing (single JSON completion)
+ * Dynamic parts pricing (single JSON completion) + sanity bands
  * ------------------------------------------------------------------------ */
+const PART_BANDS: Record<string, { min: number; max: number }> = {
+  // conservative “OEM-equivalent retail” ranges (USD)
+  bumper: { min: 250, max: 1200 },
+  fender: { min: 150, max: 600 },
+  door: { min: 250, max: 900 },
+  hood: { min: 250, max: 900 },
+  "quarter-panel": { min: 300, max: 1200 },
+  headlight: { min: 120, max: 800 },
+  taillight: { min: 80, max: 600 },
+  grille: { min: 120, max: 500 },
+  mirror: { min: 60, max: 300 },
+  windshield: { min: 180, max: 600 },
+  wheel: { min: 120, max: 900 },
+  trunk: { min: 250, max: 900 },
+
+  // “trim/cheap” items — keep realistic (door handle etc.)
+  "door handle": { min: 40, max: 180 },
+  handle: { min: 40, max: 180 },
+  bracket: { min: 30, max: 200 },
+  clip: { min: 2, max: 15 },
+  emblem: { min: 10, max: 60 },
+};
+
+function guardPartPrice(name: string, raw: number): number {
+  const norm = name.trim().toLowerCase();
+  const band = PART_BANDS[norm];
+  const val = Math.max(1, Math.round(raw || PARTS_BASE));
+  if (!band) return Math.max(50, val); // global sanity floor
+  return Math.min(band.max, Math.max(band.min, val));
+}
+
 async function pricePartsDynamicOnce(
   uniqueParts: string[],
   vehicle: Vehicle,
@@ -169,8 +212,8 @@ Example: {"bumper": 580, "fender": 320}`.trim();
 
     for (const [k, v] of Object.entries(parsed)) {
       const key = String(k).toLowerCase();
-      const val = typeof v === "number" && Number.isFinite(v) ? Math.max(50, Math.round(v)) : PARTS_BASE;
-      out[key] = val;
+      const guarded = guardPartPrice(key, typeof v === "number" && Number.isFinite(v) ? v : PARTS_BASE);
+      out[key] = guarded;
     }
     return out;
   } catch {
@@ -229,81 +272,117 @@ function estimateFromItems(
 ) {
   const priceMap = opts?.partsPriceMap || {};
 
-  let labor = 0;
-  let paint = 0;
+  let laborHours = 0;            // raw hours from line items (may be PDR-adjusted)
+  let labor = 0;                 // $ after correction
+  let paint = 0;                 // $ per panel
   let partsTotal = 0;
-
-  const paintedZones = new Set<string>();
 
   type CostLine = {
     zone: string;
     part: Part;
-    est_labor_hours: number;
-    paint_cost: number;
+    est_labor_hours: number;   // raw hours per line (pre-correction)
+    paint_cost: number;        // dollars per panel (with blend discount when applicable)
     parts_cost: number;
   };
   const lines: CostLine[] = [];
 
-  // Aggregate per-part counts for detailed view
   const partCounts: Record<string, number> = {};
 
-  for (const d of items) {
-    const sev = Number(d.severity ?? 1);
-    const hrs = typeof d.est_labor_hours === "number" ? d.est_labor_hours : hoursFor(d.part, sev);
+  let hasFrontSevere = false;
+  let hasRearSevere = false;
+  let hasAnySev3Plus = false;
 
-    const dmgType = String(d.damage_type || "");
-    const needsPaint = typeof d.needs_paint === "boolean" ? d.needs_paint : needsPaintFor(dmgType, sev, d.part);
+  const isLightBlend = (d: DamageItem) => {
+    const t = String(d.damage_type || "");
+    return (t.includes("scratch") || t.includes("paint")) && (Number(d.severity ?? 1) <= 2);
+  };
 
-    const zone = String(d.zone || "unknown");
-    const paintCostLine = needsPaint && zone ? PAINT_PER_ZONE : 0;
-    const countZone = needsPaint && zone && !paintedZones.has(zone);
-    if (countZone) paintedZones.add(zone);
+  for (const d0 of items) {
+    const sev = Number(d0.severity ?? 1);
+    const dmgType = String(d0.damage_type || "");
+    const pdr = minorDentPDR(d0);
 
-    // Parts: prefer likely_parts; fallback to severe panel when sev >= 4
-    const likelyParts = Array.isArray(d.likely_parts) ? d.likely_parts.map(String) : [];
+    // Apply PDR adjustments if eligible
+    const estHours = typeof pdr.adjHours === "number" ? pdr.adjHours : hoursFor(d0.part, sev);
+    const needsPaint = typeof pdr.adjPaint === "boolean" ? pdr.adjPaint : needsPaintFor(dmgType, sev, d0.part);
+
+    laborHours += estHours;
+
+    // paint per panel line
+    let paintCostLine = 0;
+    if (needsPaint) {
+      const factor = isLightBlend(d0) ? BLEND_DISCOUNT : 1.0;
+      paintCostLine = Math.round(PAINT_PER_PANEL * factor);
+    }
+
+    // parts per line
+    const likelyParts = Array.isArray(d0.likely_parts) ? d0.likely_parts.map(String) : [];
     const candidates =
       likelyParts.length > 0
         ? likelyParts
-        : sev >= 4 && d.part && d.part !== "unknown"
-        ? [String(d.part)]
+        : sev >= 4 && d0.part && d0.part !== "unknown"
+        ? [String(d0.part)]
         : [];
 
     let partsCostLine = 0;
     for (const raw of candidates) {
       const name = raw.trim().toLowerCase();
-      if (!name || /paint/i.test(name)) continue; // never charge "paint" as a part
-      const unit = priceMap[name] ?? PARTS_BASE;
+      if (!name || /paint/i.test(name)) continue;
+      const unit = priceMap[name] ?? guardPartPrice(name, PARTS_BASE);
       partsCostLine += unit;
       partCounts[name] = (partCounts[name] ?? 0) + 1;
     }
 
-    labor += hrs * LABOR_RATE;
-    if (countZone) paint += PAINT_PER_ZONE;
+    hasAnySev3Plus = hasAnySev3Plus || sev >= 3;
+    const z = String(d0.zone || "unknown");
+    if (sev >= 4) {
+      if (z.startsWith("front")) hasFrontSevere = true;
+      if (z.startsWith("rear"))  hasRearSevere = true;
+    }
+
     partsTotal += partsCostLine;
 
     lines.push({
-      zone,
-      part: d.part,
-      est_labor_hours: +hrs.toFixed(2),
+      zone: z,
+      part: d0.part,
+      est_labor_hours: +estHours.toFixed(2),
       paint_cost: paintCostLine,
       parts_cost: partsCostLine,
     });
   }
 
-  // Build parts_detail = qty × unit_price
+  const laborPreCorrection = Math.round(laborHours * LABOR_RATE);
+  labor = Math.round(laborPreCorrection * LABOR_CORRECTION);
+
+  paint = Math.round(lines.reduce((s, l) => s + (l.paint_cost || 0), 0));
+
   const parts_detail: PartDetail[] = Object.entries(partCounts)
     .map(([name, qty]) => {
-      const unit = priceMap[name] ?? PARTS_BASE;
+      const unit = priceMap[name] ?? guardPartPrice(name, PARTS_BASE);
       return { name, qty, unit_price: unit, line_total: qty * unit };
     })
     .sort((a, b) => b.line_total - a.line_total);
 
-  // Keep parts total in sync with detail rows
   const partsFromDetail = parts_detail.reduce((s, p) => s + p.line_total, 0);
   if (partsFromDetail !== partsTotal) partsTotal = partsFromDetail;
 
-  const subtotal = labor + paint + partsTotal;
-  const variance = items.some((i) => Number(i.severity ?? 1) >= 4) ? 0.25 : 0.15;
+  // Contingency (hidden/teardown)
+  let contPct = 0;
+  if (hasAnySev3Plus) contPct += CONT_BASE;
+  if (hasFrontSevere)  contPct += CONT_FRONT_HEAVY;
+  else if (hasRearSevere) contPct += CONT_REAR_HEAVY;
+  contPct = Math.min(contPct, CONT_MAX);
+
+  const contBase = labor + partsTotal; // contingency on labor+parts
+  const contingency = Math.round(contBase * contPct);
+
+  const subtotal = labor + paint + partsTotal + contingency;
+
+  // Variance policy: ±15% base; widen to ±25% if severe or contingency is applied
+  const variance =
+    (items.some((i) => Number(i.severity ?? 1) >= 4) || contingency > 0)
+      ? VARIANCE_SEVERE
+      : VARIANCE_BASE;
 
   return {
     currency: "USD" as const,
@@ -311,14 +390,22 @@ function estimateFromItems(
     cost_high: Math.round(subtotal * (1 + variance)),
     assumptions: [
       `Labor rate: $${LABOR_RATE}/hr`,
-      `Paint & materials: $${PAINT_PER_ZONE} per zone`,
-      `Parts pricing: ${Object.keys(priceMap).length ? "dynamic (vehicle/part informed)" : "baseline midpoint"}`,
+      `Labor correction: ×${LABOR_CORRECTION.toFixed(2)} (R&I/setup/omissions)`,
+      `Paint & materials: $${PAINT_PER_PANEL} per panel (light blends ×${BLEND_DISCOUNT})`,
+      `Parts pricing: ${Object.keys(priceMap).length ? "dynamic (vehicle/part informed, sanity-banded)" : "baseline midpoint (sanity-banded)"}`,
+      `Hidden damage contingency: ${(contPct * 100).toFixed(0)}% on labor+parts`,
+      `Variance band: ±${Math.round(variance * 100)}%`,
       "Visual-only estimate; subject to teardown",
     ],
     breakdown: {
-      labor: Math.round(labor),
-      paint: Math.round(paint),
+      labor,
+      labor_pre_correction: laborPreCorrection,
+      labor_correction_factor: LABOR_CORRECTION,
+      paint,
+      paint_units: lines.filter(l => (l.paint_cost || 0) > 0).length,
+      blend_discount: BLEND_DISCOUNT,
       parts: Math.round(partsTotal),
+      contingency,
       dynamic_parts_used: Object.keys(priceMap).length > 0,
       lines,
       parts_detail: parts_detail.length ? parts_detail : undefined,
@@ -343,14 +430,10 @@ export async function POST(req: NextRequest) {
       try {
         const parsed = JSON.parse(yoloSeedsRaw) as unknown;
         if (Array.isArray(parsed)) yoloSeeds = (parsed as unknown[]).filter(isYoloSeed) as YoloSeed[];
-      } catch {
-        /* tolerate malformed seeds */
-      }
+      } catch { /* tolerate malformed seeds */ }
     }
 
-    if (!file && !imageUrl) {
-      return errJson("No file or imageUrl provided", ERR.NO_IMAGE, 400);
-    }
+    if (!file && !imageUrl) return errJson("No file or imageUrl provided", ERR.NO_IMAGE, 400);
 
     // Build OpenAI image source + audit hash
     let imageSourceUrl: string;
@@ -364,12 +447,8 @@ export async function POST(req: NextRequest) {
     } else {
       try {
         const u = new URL(imageUrl!);
-        if (!/^https?:$/.test(u.protocol)) {
-          return errJson("imageUrl must be http(s)", ERR.BAD_URL, 400);
-        }
-      } catch {
-        return errJson("Invalid imageUrl", ERR.BAD_URL, 400);
-      }
+        if (!/^https?:$/.test(u.protocol)) return errJson("imageUrl must be http(s)", ERR.BAD_URL, 400);
+      } catch { return errJson("Invalid imageUrl", ERR.BAD_URL, 400); }
       imageSourceUrl = imageUrl!;
       imageHash = sha256String(imageUrl!);
     }
@@ -495,7 +574,7 @@ Rules:
       confidence: typeof vehicleRec["confidence"] === "number" ? (vehicleRec["confidence"] as number) : 0,
     };
 
-    // Dynamic parts pricing map (best-effort)
+    // Dynamic parts pricing map (best-effort + sanity bands)
     const uniqueParts = Array.from(
       new Set(
         itemsFinal
@@ -514,7 +593,6 @@ Rules:
     const estimate = estimateFromItems(itemsFinal, { partsPriceMap });
     const decision = routeDecision(itemsFinal, estimate);
 
-    // Narrative & notes passthrough
     const narrative = isRecord(parsed) && typeof (parsed as Record<string, unknown>)["narrative"] === "string"
       ? ((parsed as Record<string, unknown>)["narrative"] as string)
       : "";
@@ -523,7 +601,6 @@ Rules:
         ? ((parsed as Record<string, unknown>)["normalization_notes"] as string)
         : "";
 
-    // Short summary for quick scan/logging
     const damage_summary = (
       itemsFinal.length
         ? itemsFinal.map((d) => `${d.zone} ${d.part} — ${d.damage_type}, sev ${d.severity}`).join("; ")
@@ -531,7 +608,7 @@ Rules:
     ).slice(0, 400);
 
     const payload: AnalyzePayload = {
-      schema_version: "1.5.0",
+      schema_version: "1.6.0",
       model: MODEL_ID,
       runId: crypto.randomUUID(),
       image_sha256: imageHash,

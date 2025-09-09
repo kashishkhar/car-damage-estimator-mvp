@@ -1,7 +1,13 @@
-/**
- * Shared type definitions for the Car Damage Estimator.
- * These types are imported by both the server routes and client UI.
- */
+// app/types.ts
+// -------------------------------------------------------------------------------------------------
+// Shared type definitions for the Car Damage Estimator.
+// These types are consumed by both server routes (/api/detect, /api/analyze) and the client UI.
+// Keep this file as the single source of truth to avoid drift.
+// -------------------------------------------------------------------------------------------------
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Common primitives
+ * ------------------------------------------------------------------------ */
 
 /** Normalized YOLO bounding box (x, y, w, h) in [0..1] space. */
 export type YoloBoxRel = {
@@ -19,10 +25,9 @@ export type Vehicle = {
 export type ApiError = { error: string; error_code?: string };
 
 /* ──────────────────────────────────────────────────────────────────────────
- * Roboflow debug block (used only in debug UIs)
+ * Detect route: optional Roboflow debug block (for client debug panel)
  * ------------------------------------------------------------------------ */
 
-/** Narrow, explicit shape for the optional debug payload returned by detect. */
 export type RoboflowDebug = {
   enabled: boolean;
   /** Missing required env vars on the server (if any). */
@@ -62,13 +67,13 @@ export type DetectPayload = {
   is_vehicle: boolean;  // gate: is the image a vehicle?
   has_damage: boolean;  // inferred: yolo_boxes.length > 0
   quality_ok: boolean;  // usable image?
-  issues: string[];     // e.g., ["blurry","low_light"]
-  /** Optional debug info from Roboflow (only present when enabled server-side). */
+  issues: string[];     // e.g., ["blurry","low_light","no_yolo_detections"]
+  /** Optional debug info from Roboflow (present when enabled server-side). */
   yolo_debug?: RoboflowDebug;
 };
 
 /* ──────────────────────────────────────────────────────────────────────────
- * Analyze route payload primitives
+ * Analyze route primitives
  * ------------------------------------------------------------------------ */
 
 export type Zone =
@@ -84,7 +89,7 @@ export type DamageType =
   | "dent" | "scratch" | "crack" | "paint-chips"
   | "broken" | "bent" | "missing" | "glass-crack" | "unknown";
 
-/** A single modeled damage item returned by the vision LLM. */
+/** A single modeled damage item returned by the vision model. */
 export type DamageItem = {
   zone: Zone;
   part: Part;
@@ -99,45 +104,51 @@ export type DamageItem = {
 };
 
 /* ──────────────────────────────────────────────────────────────────────────
- * Cost model & breakdown (used by Cost Breakdown UI)
+ * Cost model & breakdown (server → client, used by Cost Breakdown UI)
  * ------------------------------------------------------------------------ */
 
-export type CostBreakdownLine = {
-  /** Zone label used for de-duping paint/materials per zone. */
+export type EstimateBreakdownLine = {
+  /** Zone label (used by UI; paint may be deduped per panel on server). */
   zone: string;
-  /** Primary panel/part the line refers to (for context). */
+  /** Primary panel/part the line refers to (for context only). */
   part: Part;
-  /** Hours used for labor $$ calculation. */
+  /** Hours used for labor $ calculation (pre-correction). */
   est_labor_hours: number;
-  /** Paint $ applied to this line (totals only count each zone once). */
+  /** Paint $ applied to this line (UI totals leverage paint_units). */
   paint_cost: number;
-  /** Parts $ for this line (sum of all candidate parts for this damage). */
+  /** Parts $ for this line (sum of candidate parts for this damage). */
   parts_cost: number;
 };
 
-/** Itemized dynamic parts detail (used for UI display). */
 export type PartDetail = {
   name: string;       // normalized (lowercase)
   qty: number;        // occurrences across damage items
-  unit_price: number; // price used per unit (dynamic or baseline)
+  unit_price: number; // price used per unit (dynamic or baseline, sanity-banded)
   line_total: number; // qty * unit_price
 };
 
-export type CostBand = {
+export type EstimateBreakdown = {
+  labor: number;                     // corrected labor $
+  labor_pre_correction: number;      // baseHours * laborRate
+  labor_correction_factor: number;   // e.g., 1.40
+  paint: number;                     // total paint & materials $
+  paint_units: number;               // server-deduped panel count
+  blend_discount: number;            // e.g., 0.6 for light blends
+  parts: number;                     // total parts $
+  contingency: number;               // hidden/teardown $
+  dynamic_parts_used: boolean;       // true if dynamic pricing was attempted
+  lines: EstimateBreakdownLine[];    // per-damage line summary
+  parts_detail?: PartDetail[];       // optional per-part detail (when dynamic used)
+};
+
+export type Estimate = {
   currency: "USD";
   cost_low: number;
   cost_high: number;
-  /** Human-readable assumptions that the UI shows inline. */
+  /** Human-readable assumptions the UI shows inline. */
   assumptions: string[];
-  /** Optional: structured numbers to render the Cost Breakdown expander. */
-  breakdown?: {
-    labor: number;
-    paint: number;
-    parts: number;
-    dynamic_parts_used: boolean;
-    lines: CostBreakdownLine[];
-    parts_detail?: PartDetail[];
-  };
+  /** Structured numbers to render the Cost Breakdown expander. */
+  breakdown: EstimateBreakdown;
 };
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -149,7 +160,6 @@ export type Decision =
   | { label: "INVESTIGATE"; reasons: string[] }
   | { label: "SPECIALIST"; reasons: string[] };
 
-/** Canonical server response used by the client UI. */
 export type AnalyzePayload = {
   schema_version: string;
   model: string;
@@ -159,7 +169,7 @@ export type AnalyzePayload = {
   damage_items: DamageItem[];
   narrative: string;
   normalization_notes: string;
-  estimate: CostBand;
+  estimate: Estimate;
   decision: Decision;
   /** 1–2 line summary for copy/paste; ~400 chars max. */
   damage_summary: string;

@@ -3,14 +3,17 @@
 
 /**
  * Car Damage Estimator — Client UI
- * - Upload or paste image URL → /api/detect → /api/analyze
- * - Overlay drawing (bbox/polygon), damage table with filters/sorting
- * - Cost band with an explainer and per-part breakdown (qty × unit = total)
+ * Flow: Upload/URL → /api/detect → /api/analyze
+ * - YOLO overlay (object-contain letterbox aware)
+ * - Decision/routing explainer (policy mirrored via NEXT_PUBLIC_*)
+ * - Cost band + explainer; derives visible rates from numeric totals
  * - Print-friendly report with overlay snapshot
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { AnalyzePayload, DamageItem, YoloBoxRel, RoboflowDebug } from "./types";
+import type {
+  AnalyzePayload, DamageItem, YoloBoxRel, RoboflowDebug,
+} from "./types";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Public thresholds (mirror server; safe to expose)
@@ -57,12 +60,7 @@ function isYoloBoxRel(v: unknown): v is YoloBoxRel {
   const o = v as Record<string, unknown>;
   const bbox = o["bbox_rel"];
   const conf = o["confidence"];
-  return (
-    Array.isArray(bbox) &&
-    bbox.length === 4 &&
-    bbox.every((n) => typeof n === "number") &&
-    typeof conf === "number"
-  );
+  return Array.isArray(bbox) && bbox.length === 4 && bbox.every((n) => typeof n === "number") && typeof conf === "number";
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -90,7 +88,10 @@ function fileToDataUrl(f: File) {
   return new Promise<string>((resolve, reject) => { r.onload = () => resolve(r.result as string); r.onerror = reject; r.readAsDataURL(f); });
 }
 function loadImage(src: string) {
-  return new Promise<HTMLImageElement>((resolve, reject) => { const img = new Image(); img.crossOrigin = "anonymous"; img.onload = () => resolve(img); img.onerror = reject; img.src = src; });
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image(); img.crossOrigin = "anonymous";
+    img.onload = () => resolve(img); img.onerror = reject; img.src = src;
+  });
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -117,14 +118,8 @@ function label(ctx: CanvasRenderingContext2D, text: string, x: number, y: number
 
 /** YOLO overlay that matches <img> with object-contain + letterboxing */
 function YoloCanvasOverlay({
-  imgRef,
-  boxes,
-  show,
-}: {
-  imgRef: React.RefObject<HTMLImageElement>;
-  boxes: YoloBoxRel[];
-  show: boolean;
-}) {
+  imgRef, boxes, show,
+}: { imgRef: React.RefObject<HTMLImageElement>; boxes: YoloBoxRel[]; show: boolean }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -161,11 +156,9 @@ function YoloCanvasOverlay({
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     if (!show || cssW <= 0 || cssH <= 0) return;
 
-    // ----- LETTERBOX COMPENSATION (object-contain) -----
-    // Compute the inner drawn bitmap rect inside the <img> element
+    // LETTERBOX COMPENSATION (object-contain)
     const naturalW = img.naturalWidth || cssW;
     const naturalH = img.naturalHeight || cssH;
-
     const scale = Math.min(cssW / naturalW, cssH / naturalH);
     const renderedW = naturalW * scale;
     const renderedH = naturalH * scale;
@@ -201,7 +194,6 @@ function YoloCanvasOverlay({
       ctx.fillStyle = "#fff";
       ctx.fillText(label, x + pad, ly + 2);
 
-      // restore fill color for next rect
       ctx.fillStyle = "rgba(16,185,129,0.2)";
     });
 
@@ -251,34 +243,26 @@ async function overlaySnapshot(src: string, items: DamageItem[], targetW = 1200)
   return canvas.toDataURL("image/jpeg", 0.92);
 }
 
-// Helper for print logic
+// Helper for print logic when only YOLO boxes are present
 async function overlaySnapshotYolo(src: string, boxes: YoloBoxRel[], targetW = 1200) {
   const img = await loadImage(src);
   const scale = Math.min(1, targetW / img.naturalWidth);
   const w = Math.round(img.naturalWidth * scale), h = Math.round(img.naturalHeight * scale);
   const canvas = document.createElement("canvas"); canvas.width = w; canvas.height = h;
   const ctx = canvas.getContext("2d")!;
-  ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, w, h);
-  ctx.drawImage(img, 0, 0, w, h);
+  ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, w, h); ctx.drawImage(img, 0, 0, w, h);
 
-  ctx.lineWidth = 2;
-  ctx.strokeStyle = "#10b981";
-  ctx.fillStyle = "rgba(16,185,129,0.2)";
-
+  ctx.lineWidth = 2; ctx.strokeStyle = "#10b981"; ctx.fillStyle = "rgba(16,185,129,0.2)";
   boxes.forEach(({ bbox_rel: [nx, ny, nw, nh], confidence }) => {
     const x = nx * w, y = ny * h, ww = nw * w, hh = nh * h;
     ctx.beginPath(); ctx.rect(x, y, ww, hh); ctx.fill(); ctx.stroke();
 
     const label = `${Math.round(confidence * 100)}%`;
-    const pad = 4, lh = 16;
-    const tw = ctx.measureText(label).width + pad * 2;
+    const pad = 4, lh = 16, tw = ctx.measureText(label).width + pad * 2;
     ctx.fillStyle = "rgba(0,0,0,0.75)";
     ctx.fillRect(x, Math.max(0, y - lh - 2), tw, lh);
-    ctx.fillStyle = "#fff";
-    ctx.font = "12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
-    ctx.textBaseline = "top";
-    ctx.fillText(label, x + pad, Math.max(0, y - lh - 2) + 2);
-
+    ctx.fillStyle = "#fff"; ctx.font = "12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
+    ctx.textBaseline = "top"; ctx.fillText(label, x + pad, Math.max(0, y - lh - 2) + 2);
     ctx.fillStyle = "rgba(16,185,129,0.2)";
   });
 
@@ -320,7 +304,10 @@ function buildSummary(result: AnalyzePayload): string {
   const items: DamageItem[] = Array.isArray(result?.damage_items) ? result.damage_items : [];
   if (!items.length) return result?.narrative || "No visible damage detected.";
 
-  const humanJoin = (arr: string[]) => arr.length <= 1 ? (arr[0] || "") : arr.length === 2 ? `${arr[0]} and ${arr[1]}` : `${arr.slice(0, -1).join(", ")}, and ${arr[arr.length - 1]}`;
+  const humanJoin = (arr: string[]) =>
+    arr.length <= 1 ? (arr[0] || "") : arr.length === 2
+      ? `${arr[0]} and ${arr[1]}`
+      : `${arr.slice(0, -1).join(", ")}, and ${arr[arr.length - 1]}`;
 
   const phrases = items.map((d) => {
     const sevText = d.severity >= 5 ? "severe" : d.severity === 4 ? "major" : d.severity === 3 ? "moderate" : "minor";
@@ -331,11 +318,12 @@ function buildSummary(result: AnalyzePayload): string {
     const typeText = typeMap[d.damage_type] || d.damage_type;
     const zonePart = [d.zone, d.part].filter(Boolean).join(" ");
     const likely = (Array.isArray(d.likely_parts) ? d.likely_parts : []).map(String).filter(p => p && !/paint/i.test(p));
-    return `${sevText} ${typeText} on the ${zonePart}${d.needs_paint ? " requiring repainting" : ""}${likely.length ? ` with possible replacement of ${humanJoin(Array.from(new Set(likely)))}` : ""}`;
+    return `${sevText} ${typeText} on the ${zonePart}${d.needs_paint ? " requiring repainting" : ""}${
+      likely.length ? ` with possible replacement of ${humanJoin(Array.from(new Set(likely)))}` : ""}`;
   });
 
   const joined = phrases.length > 1 ? `${phrases.slice(0, -1).join("; ")}, and ${phrases.slice(-1)}` : phrases[0];
-  return `The inspection identified ${joined}. Based on the detected severity levels, professional repair work is recommended to restore the vehicle to safe operating condition.`;
+  return `The inspection identified ${joined}. Based on severity and visibility, professional repair is recommended to restore the vehicle to safe operating condition.`;
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -451,6 +439,7 @@ function costClass(cost?: number) {
   return "border-amber-200 bg-amber-50 text-amber-700";
 }
 function confClass(conf: number) { return conf >= AUTO_MIN_CONF ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-amber-200 bg-amber-50 text-amber-700"; }
+
 function whyBlurb(label: "AUTO-APPROVE" | "INVESTIGATE" | "SPECIALIST", m: { maxSev: number; costHigh?: number; aggConf: number; }) {
   if (label === "SPECIALIST") {
     if (m.maxSev >= SPEC_MIN_SEVERITY && (m.costHigh ?? 0) >= SPEC_MIN_COST) return "Escalated because severity and cost exceed specialist thresholds.";
@@ -519,7 +508,7 @@ export default function Home() {
 
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
-    setLoading(true); setError(""); setValidationIssues(null); setResult(null); setYoloBoxes([]); setDetectIssues(null); setYoloDebug(null);    
+    setLoading(true); setError(""); setValidationIssues(null); setResult(null); setYoloBoxes([]); setDetectIssues(null); setYoloDebug(null);
 
     try {
       const analyzeForm = new FormData(), detectForm = new FormData();
@@ -530,7 +519,7 @@ export default function Home() {
         const dataUrl = await fileToDataUrl(compressed);
         detectForm.append("file", compressed);
         analyzeForm.append("file", compressed);
-        analyzeForm.append("image_data_url", dataUrl); // (optional server-side use)
+        analyzeForm.append("image_data_url", dataUrl); // optional server-side use
       } else {
         const raw = imageUrl.trim();
         if (!raw) { setError("Please paste an image link to analyze."); return; }
@@ -551,35 +540,27 @@ export default function Home() {
         return;
       }
 
-      // Save YOLO boxes for overlays + detect issues for UI
       const boxes = Array.isArray(detectJson?.yolo_boxes)
         ? (detectJson.yolo_boxes as unknown[]).filter(isYoloBoxRel) as YoloBoxRel[]
         : [];
       setYoloBoxes(boxes);
 
-      if (Array.isArray(detectJson?.issues) && detectJson.issues.length) {
-        setDetectIssues(detectJson.issues.map(String));
-      }
+      if (Array.isArray(detectJson?.issues) && detectJson.issues.length) setDetectIssues(detectJson.issues.map(String));
 
-      // 2) ANALYZE – pass YOLO boxes as seeds if present (typed, guarded)
+      // 2) ANALYZE – pass YOLO boxes as seeds if present
       const seeds: { bbox_rel: [number, number, number, number]; confidence: number }[] =
         Array.isArray(detectJson?.yolo_boxes)
           ? (detectJson.yolo_boxes as unknown[])
               .filter(isYoloBoxRel)
-              .map((b) => ({
-                bbox_rel: b.bbox_rel,
-                confidence: typeof b.confidence === "number" ? b.confidence : 0.5,
-              }))
+              .map((b) => ({ bbox_rel: b.bbox_rel, confidence: typeof b.confidence === "number" ? b.confidence : 0.5 }))
           : [];
-
       analyzeForm.append("yolo", JSON.stringify(seeds));
 
-      // 2) ANALYZE
       const ar = await fetch("/api/analyze", { method: "POST", body: analyzeForm });
       if (!ar.ok) { setError(friendlyApiError(await ar.text(), ar.status)); return; }
       const j = await ar.json();
 
-      // A couple of guardrails to avoid false positives on non-vehicle photos:
+      // Avoid false positives on non-vehicle photos
       const noItems = !Array.isArray(j?.damage_items) || j.damage_items.length === 0;
       if (noItems && Number(j?.vehicle?.confidence ?? 0) < 0.15) {
         setError("We couldn't detect a vehicle in that image. Please upload a photo that clearly shows a vehicle.");
@@ -627,7 +608,8 @@ export default function Home() {
     return [...filtered].sort((a, b) => ((Number(a?.[sortKey] ?? 0) - Number(b?.[sortKey] ?? 0)) * dirMul));
   }, [result, fPaint, fConfMin, fSearch, sortKey, sortDir]);
 
-  const decisionConf = useMemo(() => aggDecisionConf(Array.isArray(result?.damage_items) ? result.damage_items : []), [result]);
+  const decisionConf = useMemo(() =>
+    aggDecisionConf(Array.isArray(result?.damage_items) ? result.damage_items : []), [result]);
 
   const copyToClipboard = useCallback(async (text: string, which: "summary" | "estimate") => {
     try {
@@ -644,7 +626,6 @@ export default function Home() {
           try { setSnapshotUrl(await overlaySnapshotYolo(preview, yoloBoxes)); }
           catch { setSnapshotUrl(preview); }
         } else if (result?.damage_items?.length) {
-          // fallback to legacy LLM snapshot if needed
           try { setSnapshotUrl(await overlaySnapshot(preview, result.damage_items)); }
           catch { setSnapshotUrl(preview); }
         } else {
@@ -655,7 +636,7 @@ export default function Home() {
       }
     } catch {}
     window.print();
-  }, [preview, result, yoloBoxes]);  
+  }, [preview, result, yoloBoxes]);
 
   const samples = [
     { url: "https://preview.redd.it/could-this-side-impact-damage-possibly-be-a-structural-v0-48xk2ye4dad81.jpg?width=640&crop=smart&auto=webp&s=2e8661fe071e2aacbd413ca4821aab837859176c" },
@@ -749,7 +730,7 @@ export default function Home() {
 
               <div aria-live="polite">
                 {error && (<div className="rounded-lg border border-rose-200/70 bg-rose-50/80 p-3 text-sm text-rose-700">{String(error)}</div>)}
-                </div>
+              </div>
 
               <div className="pt-1 flex flex-col gap-2">
                 <Checkbox id="overlay" checked={showOverlay} onChange={setShowOverlay} label="Show damage overlay" />
@@ -765,11 +746,7 @@ export default function Home() {
                   <>
                     <img ref={imgRef} src={preview} alt="preview" className="w-full rounded-lg border border-slate-200 max-h-[360px] object-contain bg-slate-50" />
                     {showOverlay && (
-                      <YoloCanvasOverlay
-                        imgRef={imgRef as React.RefObject<HTMLImageElement>}
-                        boxes={yoloBoxes}
-                        show={showOverlay}
-                      />
+                      <YoloCanvasOverlay imgRef={imgRef as React.RefObject<HTMLImageElement>} boxes={yoloBoxes} show={showOverlay} />
                     )}
                   </>
                 ) : (
@@ -878,7 +855,7 @@ export default function Home() {
                 </div>
                 <div><span className="font-medium">Severity colors:</span> 1–2 (green) • 3 (yellow) • 4 (orange) • 5 (red)</div>
                 <div><span className="font-medium">Confidence bands:</span> High ≥ {Math.round(CONF_HIGH * 100)}% • Medium ≥ {Math.round(CONF_MED * 100)}% • otherwise Low</div>
-                <div><span className="font-medium">Cost assumptions:</span> Labor rate & paint/materials from environment; parts allowance may be dynamic or baseline.</div>
+                <div><span className="font-medium">Cost assumptions:</span> Server-side policy drives labor, paint, parts, and contingency.</div>
               </div>
             </div>
           </div>
@@ -908,7 +885,13 @@ export default function Home() {
 
                 {showWhy && (
                   <div className="mt-2 space-y-3">
-                    <div className="text-xs text-slate-700">{whyBlurb(result.decision.label, { maxSev: Math.max(0, ...(result.damage_items ?? []).map(d => Number(d.severity ?? 0))), costHigh: result.estimate?.cost_high, aggConf: decisionConf })}</div>
+                    <div className="text-xs text-slate-700">
+                      {whyBlurb(result.decision.label, {
+                        maxSev: Math.max(0, ...(result.damage_items ?? []).map(d => Number(d.severity ?? 0))),
+                        costHigh: result.estimate?.cost_high,
+                        aggConf: decisionConf,
+                      })}
+                    </div>
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                       <div className={`rounded-xl border px-3 py-2 ${sevClass(Math.max(0, ...(result.damage_items ?? []).map(d => Number(d.severity ?? 0))))}`}>
                         <div className="text-[11px] opacity-80">Severity (need ≤ {AUTO_MAX_SEVERITY})</div>
@@ -976,157 +959,178 @@ export default function Home() {
           )}
 
           {/* Estimate + Cost breakdown */}
-          {result && (
+          {result?.estimate?.breakdown && (
             <div className="rounded-2xl border border-white/30 bg-white/60 backdrop-blur-xl p-5">
               <div className="mb-1 flex items-center justify-between">
                 <div className="text-sm font-medium">Estimated Repair Cost</div>
-                <button type="button" onClick={() => copyToClipboard(result?.estimate ? `${money(result.estimate.cost_low)} – ${money(result.estimate.cost_high)}` : "—", "estimate")}
+                <button type="button" onClick={() => copyToClipboard(
+                  `${money(result.estimate.cost_low)} – ${money(result.estimate.cost_high)}`, "estimate")}
                         className="inline-flex h-7 w-7 items-center justify-center rounded border border-slate-300 bg-white/70 hover:bg-white/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500" title="Copy estimate">
                   {copiedEstimate ? <CheckIcon className="h-4 w-4" /> : <CopyIcon className="h-4 w-4" />}
                 </button>
               </div>
 
               <div className="text-xl font-semibold tracking-tight">
-                {result?.estimate ? `${money(result.estimate.cost_low)} – ${money(result.estimate.cost_high)}` : "—"}
+                {money(result.estimate.cost_low)} – {money(result.estimate.cost_high)}
               </div>
-              {Array.isArray(result?.estimate?.assumptions) && result.estimate.assumptions.length > 0 && (
+              {Array.isArray(result.estimate.assumptions) && result.estimate.assumptions.length > 0 && (
                 <div className="mt-2 text-xs text-slate-500">{result.estimate.assumptions.join(" • ")}</div>
               )}
 
-              {result?.estimate?.breakdown && (
-                <div className="mt-3">
-                  <button type="button" onClick={() => setShowCost(v => !v)} className="text-xs text-indigo-700 hover:text-indigo-900 underline underline-offset-2">
-                    {showCost ? "Hide details" : "Cost breakdown"}
-                  </button>
+              <div className="mt-3">
+                <button type="button" onClick={() => setShowCost(v => !v)} className="text-xs text-indigo-700 hover:text-indigo-900 underline underline-offset-2">
+                  {showCost ? "Hide details" : "Cost breakdown"}
+                </button>
 
-                  {/* Three-row, no-table explainer */}
-                  {showCost && (() => {
-                    const bd = result.estimate.breakdown!;
-                    const assumptions = Array.isArray(result.estimate.assumptions) ? result.estimate.assumptions : [];
+                {/* Three-row, no-table explainer */}
+                {showCost && (() => {
+                  const bd = result.estimate.breakdown!;
+                  const assumptions = Array.isArray(result.estimate.assumptions) ? result.estimate.assumptions : [];
 
-                    // Helper: extract a number if present (kept as a fallback only)
-                    const numOr = (s: string | undefined, fallback: number) => {
-                      const m = s?.match(/\$?(\d+(?:\.\d+)?)/);
-                      return m ? Number(m[1]) : fallback;
-                    };
+                  const numOr = (s: string | undefined, fallback: number) => {
+                    const m = s?.match(/\$?(\d+(?:\.\d+)?)/); return m ? Number(m[1]) : fallback;
+                  };
 
-                    // Totals to derive true rates from the numeric breakdown
-                    const totalHours = bd.lines.reduce((s, l) => s + Number(l.est_labor_hours || 0), 0);
-                    const paintedZones = new Set(
-                      bd.lines
-                        .filter(l => (l.paint_cost || 0) > 0)
-                        .map(l => String(l.zone || ""))
-                    );
-                    const paintedZoneCount = paintedZones.size;
+                  // Totals to derive true rates from numeric breakdown (exact)
+                  const totalHours = bd.lines.reduce((s, l) => s + Number(l.est_labor_hours || 0), 0);
 
-                    // Fallbacks from assumptions (legacy) — used only if derivation is impossible
-                    const laborAssump = assumptions.find(a => /labor/i.test(a));
-                    const paintAssump = assumptions.find(a => /(paint|material)/i.test(a));
-                    const LABOR_FALLBACK = numOr(laborAssump, 95);
-                    const PAINT_FALLBACK = numOr(paintAssump, 180);
+                  // Prefer server-deduped panel count; fallback to line count where paint_cost > 0
+                  const paintedPanelCount =
+                    typeof bd.paint_units === "number"
+                      ? bd.paint_units
+                      : bd.lines.filter((l) => (l.paint_cost || 0) > 0).length;
 
-                    // ✅ Derive the actual rates used from numeric totals (preferred, exact)
-                    const LABOR_RATE = totalHours > 0 ? Math.round(bd.labor / totalHours) : LABOR_FALLBACK;
-                    const PAINT_RATE = paintedZoneCount > 0 ? Math.round(bd.paint / paintedZoneCount) : PAINT_FALLBACK;
+                  // Fallbacks from assumptions (legacy) — used ONLY if derivation is impossible
+                  const laborAssump = assumptions.find((a) => /labor/i.test(a));
+                  const paintAssump = assumptions.find((a) => /(paint|material)/i.test(a));
+                  const LABOR_FALLBACK = numOr(laborAssump, 95);
+                  const PAINT_FALLBACK = numOr(paintAssump, 180);
 
-                    // Parts preview
-                    const partsNames = result.damage_items.flatMap(d => {
-                      const listed = Array.isArray(d.likely_parts) ? d.likely_parts.map(String) : [];
-                      if (listed.length) return listed;
-                      return d.severity >= 4 && d.part && d.part !== "unknown" ? [String(d.part)] : [];
-                    });
-                    const partsUnique = Array.from(new Set(partsNames.map(p => p.toLowerCase())));
-                    const partsCount = partsUnique.length || (bd.parts ? 1 : 0);
-                    const perPartAvg = partsCount ? Math.round(bd.parts / partsCount) : 0;
+                  // Derive BASE (pre-correction) labor rate & effective panel rate
+                  const baseLaborRate =
+                    totalHours > 0 && typeof bd.labor_pre_correction === "number"
+                      ? Math.round(bd.labor_pre_correction / totalHours)
+                      : LABOR_FALLBACK;
 
-                    const hoursStr = `${totalHours.toFixed(2)} hr${totalHours !== 1 ? "s" : ""} × $${LABOR_RATE}/hr`;
-                    const zonesStr = `${paintedZoneCount || 0} zone${paintedZoneCount === 1 ? "" : "s"} × $${PAINT_RATE}/zone`;
-                    const partsStr = partsCount
-                      ? `${partsCount} part${partsCount === 1 ? "" : "s"}${perPartAvg ? ` ~ $${perPartAvg} each` : ""}`
-                      : "No parts estimated";
+                  const laborCorr =
+                    typeof bd.labor_correction_factor === "number"
+                      ? bd.labor_correction_factor
+                      : typeof bd.labor_pre_correction === "number" && bd.labor_pre_correction > 0
+                      ? +(bd.labor / bd.labor_pre_correction).toFixed(2)
+                      : 1;
 
-                    const subtotal = bd.labor + bd.paint + bd.parts;
-                    const lo = Number(result.estimate.cost_low || 0);
-                    const hi = Number(result.estimate.cost_high || 0);
-                    const inBand = subtotal >= lo && subtotal <= hi;
+                  const effectiveLaborRate = Math.round(baseLaborRate * laborCorr);
+                  const panelRate =
+                    paintedPanelCount > 0 ? Math.round(bd.paint / paintedPanelCount) : PAINT_FALLBACK;
 
-                    return (
-                      <div className="mt-3 space-y-3">
-                        {/* Row 1: Labor */}
-                        <div className="rounded-xl border border-slate-200 bg-white/70 p-3">
-                          <div className="text-sm font-medium text-slate-900">Labor</div>
-                          <div className="mt-1 text-[13px] text-slate-700">
-                            {hoursStr} = <span className="font-medium">${bd.labor.toLocaleString()}</span>
-                          </div>
+                  // Parts preview (unique names from items)
+                  const partsNames = (result.damage_items ?? []).flatMap(d => {
+                    const listed = Array.isArray(d.likely_parts) ? d.likely_parts.map(String) : [];
+                    if (listed.length) return listed;
+                    return d.severity >= 4 && d.part && d.part !== "unknown" ? [String(d.part)] : [];
+                  });
+                  const partsUnique = Array.from(new Set(partsNames.map(p => p.toLowerCase())));
+                  const partsCount = (bd.parts_detail?.length ?? partsUnique.length) || (bd.parts ? 1 : 0);
+                  const perPartAvg = partsCount ? Math.round(bd.parts / partsCount) : 0;
+
+                  const hoursStr = `${totalHours.toFixed(2)} hr${totalHours !== 1 ? "s" : ""} × $${effectiveLaborRate}/hr`;
+                  const panelsStr = `${paintedPanelCount || 0} panel${paintedPanelCount === 1 ? "" : "s"} × $${panelRate}/panel`;
+                  const partsStr = partsCount
+                    ? `${partsCount} part${partsCount === 1 ? "" : "s"}${perPartAvg ? ` ~ $${perPartAvg} each` : ""}`
+                    : "No parts estimated";
+
+                  const contingency = Number((bd as any).contingency || 0);
+                  const subtotal = bd.labor + bd.paint + bd.parts + contingency;
+                  const lo = Number(result.estimate.cost_low || 0);
+                  const hi = Number(result.estimate.cost_high || 0);
+                  const inBand = subtotal >= lo && subtotal <= hi;
+
+                  return (
+                    <div className="mt-3 space-y-3">
+                      {/* Row 1: Labor */}
+                      <div className="rounded-xl border border-slate-200 bg-white/70 p-3">
+                        <div className="text-sm font-medium text-slate-900">Labor</div>
+                        <div className="mt-1 text-[13px] text-slate-700">
+                          {hoursStr} = <span className="font-medium">${bd.labor.toLocaleString()}</span>
                         </div>
+                      </div>
 
-                        {/* Row 2: Paint & Materials */}
-                        <div className="rounded-xl border border-slate-200 bg-white/70 p-3">
-                          <div className="text-sm font-medium text-slate-900">Paint &amp; Materials</div>
-                          <div className="mt-1 text-[13px] text-slate-700">
-                            {zonesStr} = <span className="font-medium">${bd.paint.toLocaleString()}</span>
-                          </div>
-                          {paintedZoneCount > 0 && (
-                            <div className="mt-1 text-[12px] text-slate-500">
-                              Paint is applied once per affected zone to avoid double-charging overlapping work.
-                            </div>
-                          )}
+                      {/* Row 2: Paint & Materials */}
+                      <div className="rounded-xl border border-slate-200 bg-white/70 p-3">
+                        <div className="text-sm font-medium text-slate-900">Paint &amp; Materials</div>
+                        <div className="mt-1 text-[13px] text-slate-700">
+                          {panelsStr} = <span className="font-medium">${bd.paint.toLocaleString()}</span>
                         </div>
-
-                        {/* Row 3: Parts */}
-                        <div className="rounded-xl border border-slate-200 bg-white/70 p-3">
-                          <div className="text-sm font-medium text-slate-900">Parts</div>
-
-                          {bd.dynamic_parts_used && Array.isArray(bd.parts_detail) && bd.parts_detail.length > 0 ? (
-                            <>
-                              <div className="mt-1 text-[13px] text-slate-700">
-                                {bd.parts_detail.length} part{bd.parts_detail.length === 1 ? "" : "s"} ={" "}
-                                <span className="font-medium">${bd.parts.toLocaleString()}</span>
-                                <span className="ml-2 text-[11px] text-slate-500">(dynamic)</span>
-                              </div>
-                              <ul className="mt-1 text-[12px] text-slate-600 space-y-0.5">
-                                {bd.parts_detail.slice(0, 10).map((p, i) => (
-                                  <li key={i} className="flex items-center justify-between gap-3">
-                                    <span className="truncate">{p.name} × {p.qty}</span>
-                                    <span className="whitespace-nowrap">
-                                      ${p.unit_price} = {(p.line_total).toLocaleString()}
-                                    </span>
-                                  </li>
-                                ))}
-                                {bd.parts_detail.length > 10 && (
-                                  <li className="text-[11px] text-slate-500">+{bd.parts_detail.length - 10} more</li>
-                                )}
-                              </ul>
-                            </>
-                          ) : (
-                            <div className="mt-1 text-[13px] text-slate-700">
-                              {partsStr} = <span className="font-medium">${bd.parts.toLocaleString()}</span>
-                              <span className="ml-2 text-[11px] text-slate-500">
-                                {bd.dynamic_parts_used ? "(dynamic)" : "(baseline)"}
-                              </span>
-                            </div>
-                          )}
-                        </div>
-
-                        {/* Subtotal vs Band */}
-                        <div className="flex items-center justify-between mt-2">
-                          <div className="text-sm text-slate-600">
-                            Range: <span className="font-medium">${lo.toLocaleString()} – ${hi.toLocaleString()}</span>
-                          </div>
-                          <div className={`text-lg font-semibold tracking-tight ${inBand ? "text-slate-900" : "text-amber-700"}`}>
-                            Subtotal: ${subtotal.toLocaleString()}
-                          </div>
-                        </div>
-                        {!inBand && (
-                          <div className="text-[12px] text-amber-700">
-                            Note: subtotal is outside the displayed band; variance or inputs may need adjustment.
+                        {paintedPanelCount > 0 && (
+                          <div className="mt-1 text-[12px] text-slate-500">
+                            Paint is applied once per affected panel; light blends discounted where applicable.
                           </div>
                         )}
                       </div>
-                    );
-                  })()}
-                </div>
-              )}
+
+                      {/* Row 3: Parts */}
+                      <div className="rounded-xl border border-slate-200 bg-white/70 p-3">
+                        <div className="text-sm font-medium text-slate-900">Parts</div>
+
+                        {bd.dynamic_parts_used && Array.isArray(bd.parts_detail) && bd.parts_detail.length > 0 ? (
+                          <>
+                            <div className="mt-1 text-[13px] text-slate-700">
+                              {bd.parts_detail.length} part{bd.parts_detail.length === 1 ? "" : "s"} ={" "}
+                              <span className="font-medium">${bd.parts.toLocaleString()}</span>
+                              <span className="ml-2 text-[11px] text-slate-500">(dynamic + sanity bands)</span>
+                            </div>
+                            <ul className="mt-1 text-[12px] text-slate-600 space-y-0.5">
+                              {bd.parts_detail.slice(0, 10).map((p, i) => (
+                                <li key={i} className="flex items-center justify-between gap-3">
+                                  <span className="truncate">{p.name} × {p.qty}</span>
+                                  <span className="whitespace-nowrap">
+                                    ${p.unit_price} = {(p.line_total).toLocaleString()}
+                                  </span>
+                                </li>
+                              ))}
+                              {bd.parts_detail.length > 10 && (
+                                <li className="text-[11px] text-slate-500">+{bd.parts_detail.length - 10} more</li>
+                              )}
+                            </ul>
+                          </>
+                        ) : (
+                          <div className="mt-1 text-[13px] text-slate-700">
+                            {partsStr} = <span className="font-medium">${bd.parts.toLocaleString()}</span>
+                            <span className="ml-2 text-[11px] text-slate-500">
+                              {bd.dynamic_parts_used ? "(dynamic + banded)" : "(baseline + banded)"}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Row 4: Hidden/Teardown Contingency */}
+                      {((bd as any).contingency || 0) > 0 && (
+                        <div className="rounded-xl border border-slate-200 bg-white/70 p-3">
+                          <div className="text-sm font-medium text-slate-900">Hidden/Teardown Contingency</div>
+                          <div className="mt-1 text-[13px] text-slate-700">
+                            Applied to labor + parts = <span className="font-medium">${((bd as any).contingency).toLocaleString()}</span>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Subtotal vs Band */}
+                      <div className="flex items-center justify-between mt-2">
+                        <div className="text-sm text-slate-600">
+                          Range: <span className="font-medium">{money(lo)} – {money(hi)}</span>
+                        </div>
+                        <div className={`text-lg font-semibold tracking-tight ${inBand ? "text-slate-900" : "text-amber-700"}`}>
+                          Subtotal: {money(subtotal)}
+                        </div>
+                      </div>
+                      {!inBand && (
+                        <div className="text-[12px] text-amber-700">
+                          Note: subtotal is outside the displayed band; variance or inputs may need adjustment.
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
             </div>
           )}
 
